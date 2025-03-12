@@ -7,7 +7,7 @@ use std::{
     ops::Range,
 };
 
-use crate::{StringSlice, error::InternalError};
+use crate::{KFloat, KInt, StringSlice, error::InternalError};
 
 /// The type used to refer to constants in the [ConstantPool]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -49,9 +49,9 @@ impl fmt::Display for ConstantIndex {
 #[derive(Clone, Debug, PartialEq)]
 enum ConstantEntry {
     // An f64 constant
-    F64(f64),
+    KFloat(f64),
     // An i64 constant
-    I64(i64),
+    KInt(i64),
     // The range in bytes in the `ConstantPool`'s string data for a string constant
     Str(Range<usize>),
 }
@@ -60,9 +60,9 @@ enum ConstantEntry {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Constant<'a> {
     /// An f64 constant
-    F64(f64),
+    KFloat(f64),
     /// An i64 constant
-    I64(i64),
+    KInt(i64),
     /// A string constant
     Str(&'a str),
 }
@@ -106,8 +106,8 @@ impl ConstantPool {
     pub fn get(&self, index: usize) -> Option<Constant> {
         match self.constants.get(index) {
             Some(constant_info) => match constant_info {
-                ConstantEntry::F64(n) => Some(Constant::F64(*n)),
-                ConstantEntry::I64(n) => Some(Constant::I64(*n)),
+                ConstantEntry::KFloat(n) => Some(Constant::KFloat(*n)),
+                ConstantEntry::KInt(n) => Some(Constant::KInt(*n)),
                 ConstantEntry::Str(range) => Some(Constant::Str(&self.string_data[range.clone()])),
             },
             None => None,
@@ -147,9 +147,16 @@ impl ConstantPool {
     /// Returns the f64 corresponding to the provided constant index
     ///
     /// Warning! Panics if there isn't an f64 at the provided index
+    pub fn get_float(&self, index: ConstantIndex) -> f64 {
+        self.get_f64(index)
+    }
+
+    /// Returns the f64 corresponding to the provided constant index
+    ///
+    /// Warning! Panics if there isn't an f64 at the provided index
     pub fn get_f64(&self, index: ConstantIndex) -> f64 {
         match self.constants.get(usize::from(index)) {
-            Some(ConstantEntry::F64(n)) => *n,
+            Some(ConstantEntry::KFloat(n)) => *n,
             _ => panic!("Invalid index"),
         }
     }
@@ -157,9 +164,16 @@ impl ConstantPool {
     /// Returns the i64 corresponding to the provided constant index
     ///
     /// Warning! Panics if there isn't an i64 at the provided index
+    pub fn get_int(&self, index: ConstantIndex) -> i64 {
+        self.get_i64(index)
+    }
+
+    /// Returns the i64 corresponding to the provided constant index
+    ///
+    /// Warning! Panics if there isn't an i64 at the provided index
     pub fn get_i64(&self, index: ConstantIndex) -> i64 {
         match self.constants.get(usize::from(index)) {
-            Some(ConstantEntry::I64(n)) => *n,
+            Some(ConstantEntry::KInt(n)) => *n,
             _ => panic!("Invalid index"),
         }
     }
@@ -197,8 +211,8 @@ impl fmt::Display for ConstantPool {
         for (i, constant) in self.iter().enumerate() {
             write!(f, "{i:<8}")?;
             match constant {
-                Constant::F64(n) => write!(f, "Float   {n}")?,
-                Constant::I64(n) => write!(f, "Int     {n}")?,
+                Constant::KFloat(n) => write!(f, "Float   {n}")?,
+                Constant::KInt(n) => write!(f, "Int     {n}")?,
                 Constant::Str(s) => write!(f, "String  {s}")?,
             }
             writeln!(f)?;
@@ -262,6 +276,10 @@ impl ConstantPoolBuilder {
         }
     }
 
+    pub fn add_float(&mut self, n: KFloat) -> Result<ConstantIndex, InternalError> {
+        self.add_f64(n)
+    }
+
     pub fn add_f64(&mut self, n: f64) -> Result<ConstantIndex, InternalError> {
         let n_u64 = n.to_bits();
 
@@ -270,12 +288,16 @@ impl ConstantPoolBuilder {
             None => {
                 let result = ConstantIndex::try_from(self.constants.len())
                     .map_err(|_| InternalError::ConstantPoolCapacityOverflow)?;
-                self.constants.push(ConstantEntry::F64(n));
+                self.constants.push(ConstantEntry::KFloat(n));
                 n_u64.hash(&mut self.hasher);
                 self.float_map.insert(n_u64, result);
                 Ok(result)
             }
         }
+    }
+
+    pub fn add_int(&mut self, n: KInt) -> Result<ConstantIndex, InternalError> {
+        self.add_i64(n)
     }
 
     pub fn add_i64(&mut self, n: i64) -> Result<ConstantIndex, InternalError> {
@@ -284,7 +306,7 @@ impl ConstantPoolBuilder {
             None => {
                 let result = ConstantIndex::try_from(self.constants.len())
                     .map_err(|_| InternalError::ConstantPoolCapacityOverflow)?;
-                self.constants.push(ConstantEntry::I64(n));
+                self.constants.push(ConstantEntry::KInt(n));
                 n.hash(&mut self.hasher);
                 self.int_map.insert(n, result);
                 Ok(result)
@@ -405,9 +427,9 @@ mod tests {
         let pool = builder.build();
 
         let mut iter = pool.iter();
-        assert_eq!(iter.next(), Some(Constant::I64(-1)));
+        assert_eq!(iter.next(), Some(Constant::KInt(-1)));
         assert_eq!(iter.next(), Some(Constant::Str("O_o")));
-        assert_eq!(iter.next(), Some(Constant::F64(99.9)));
+        assert_eq!(iter.next(), Some(Constant::KFloat(99.9)));
         assert_eq!(iter.next(), Some(Constant::Str("^_^")));
         assert_eq!(iter.next(), None);
     }

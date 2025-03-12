@@ -1,6 +1,8 @@
 use koto_runtime::prelude::*;
 use std::ops::RangeBounds;
 
+use crate::KInt;
+
 /// Returns a KValue::List from a slice of integers
 pub fn number_list<T>(values: &[T]) -> KValue
 where
@@ -38,6 +40,6 @@ pub fn tuple(values: &[KValue]) -> KValue {
 }
 
 /// Returns a KValue::Range from given bounds
-pub fn range(bounds: impl RangeBounds<i64>) -> KValue {
+pub fn range(bounds: impl RangeBounds<KInt>) -> KValue {
     KRange::from(bounds).into()
 }

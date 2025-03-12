@@ -12,12 +12,20 @@ readme.workspace = true
 repository.workspace = true
 
 [features]
-default = ["rc"]
+default = ["rc", "num64"]
 
 # Only one memory management strategy can be enabled at a time.
 # To use `arc`, default features must be disabled.
-arc = ["koto_runtime/arc"]
 rc = ["koto_runtime/rc"]
+arc = ["koto_runtime/arc"]
+num64 = ["koto_bytecode/num64", "koto_runtime/num64"]
+num32 = ["koto_bytecode/num32", "koto_runtime/num32"]
+
+[package.metadata.cargo-feature-requirements]
+rc = { requires = ["!arc"] }
+arc = { requires = ["!rc"] }
+num64 = { requires = ["!num32"] }
+num32 = { requires = ["!num64"] }
 
 [dependencies]
 itertools = { workspace = true }

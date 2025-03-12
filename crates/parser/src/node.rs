@@ -1,6 +1,12 @@
-use crate::{StringFormatOptions, StringQuote, ast::AstIndex, constant_pool::ConstantIndex};
+use crate::{StringFormatOptions, StringQuote, ast::AstIndex};
 use smallvec::SmallVec;
 use std::fmt;
+
+#[cfg(feature = "num64")]
+use crate::constant_pool64::ConstantIndex;
+
+#[cfg(feature = "num32")]
+use crate::constant_pool32::ConstantIndex;
 
 /// The Vec type used in the AST
 //

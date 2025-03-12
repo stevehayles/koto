@@ -6,12 +6,26 @@ mod list;
 mod map;
 mod meta_map;
 mod native_function;
-mod number;
 mod object;
 mod range;
 mod tuple;
 pub mod value;
 mod value_key;
+
+#[cfg(feature = "arc")]
+mod arc;
+#[cfg(feature = "arc")]
+pub use crate::arc::*;
+
+#[cfg(feature = "num32")]
+mod number32;
+#[cfg(feature = "num32")]
+pub use self::number32::KNumber;
+
+#[cfg(feature = "num64")]
+mod number64;
+#[cfg(feature = "num64")]
+pub use self::number64::KNumber;
 
 pub use koto_parser::KString;
 
@@ -22,7 +36,6 @@ pub use self::{
     map::{KMap, KotoHasher, ValueMap},
     meta_map::{BinaryOp, MetaKey, MetaMap, UnaryOp, meta_id_to_key},
     native_function::{CallContext, KNativeFunction, KotoFunction},
-    number::KNumber,
     object::{
         IsIterable, KObject, KotoCopy, KotoEntries, KotoField, KotoObject, KotoType, MethodContext,
     },

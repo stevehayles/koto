@@ -38,7 +38,7 @@ pub fn make_module() -> KMap {
         match ctx.instance_and_args(is_range, expected_error)? {
             (KValue::Range(r), [KValue::Number(n)]) => match (r.start(), r.end()) {
                 (Some(start), Some((end, inclusive))) => {
-                    let n = i64::from(n);
+                    let n = KInt::from(n);
                     let result = if r.is_ascending() {
                         KRange::new(Some(start - n), Some((end + n, inclusive)))
                     } else {
@@ -86,7 +86,7 @@ pub fn make_module() -> KMap {
 
         match ctx.instance_and_args(is_range, expected_error)? {
             (KValue::Range(r), [KValue::Number(n)]) => {
-                let n = i64::from(n);
+                let n = KInt::from(n);
                 match (r.start(), r.end()) {
                     (Some(start), Some((end, inclusive))) => {
                         let result = if start <= end {

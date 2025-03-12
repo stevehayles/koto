@@ -1,5 +1,11 @@
 use koto_runtime::{Ptr, Result, derive::*, prelude::*};
 
+#[cfg(feature = "num64")]
+type KInt = i64;
+
+#[cfg(feature = "num32")]
+type KInt = i32;
+
 pub fn make_module() -> KMap {
     let result = KMap::with_type("regex");
 
@@ -185,7 +191,7 @@ impl Match {
 
         Self {
             text,
-            bounds: KRange::from(start as i64..end as i64),
+            bounds: KRange::from(start as KInt..end as KInt),
         }
         .into()
     }

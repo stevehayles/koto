@@ -1,6 +1,6 @@
 //! A collection of string iterators
 
-use crate::{KIteratorOutput as Output, Result, prelude::*};
+use crate::{KInt, KIteratorOutput as Output, Result, prelude::*};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// An iterator that outputs the individual bytes contained in a string
@@ -73,7 +73,7 @@ impl Iterator for CharIndices {
                 let start = self.index + start;
                 let end = start + grapheme.len();
                 self.index += grapheme.len();
-                let result = KRange::from(start as i64..end as i64);
+                let result = KRange::from(start as KInt..end as KInt);
                 Output::Value(result.into())
             })
     }

@@ -1,9 +1,8 @@
 #![cfg_attr(feature = "panic_on_parser_error", allow(unreachable_code))]
 
 use crate::{
-    StringFormatOptions,
+    KFloat, KInt, StringFormatOptions,
     ast::{Ast, AstIndex},
-    constant_pool::{ConstantIndex, ConstantPoolBuilder},
     error::{Error, ErrorKind, ExpectedIndentation, InternalError, Result, SyntaxError},
     node::*,
 };
@@ -14,6 +13,12 @@ use std::{
     iter::Peekable,
     str::{Chars, FromStr},
 };
+
+#[cfg(feature = "num64")]
+use crate::constant_pool64::{ConstantIndex, ConstantPoolBuilder};
+
+#[cfg(feature = "num32")]
+use crate::constant_pool32::{ConstantIndex, ConstantPoolBuilder};
 
 // Contains info about the current frame, representing either the module's top level or a function
 #[derive(Debug, Default)]
@@ -1781,13 +1786,13 @@ impl<'source> Parser<'source> {
         };
 
         let maybe_integer = if let Some(hex) = slice.strip_prefix("0x") {
-            i64::from_str_radix(hex, 16)
+            KInt::from_str_radix(hex, 16)
         } else if let Some(octal) = slice.strip_prefix("0o") {
-            i64::from_str_radix(octal, 8)
+            KInt::from_str_radix(octal, 8)
         } else if let Some(binary) = slice.strip_prefix("0b") {
-            i64::from_str_radix(binary, 2)
+            KInt::from_str_radix(binary, 2)
         } else {
-            i64::from_str(&slice)
+            KInt::from_str(&slice)
         };
 
         let number_node = if let Ok(n) = maybe_integer {
@@ -1797,15 +1802,15 @@ impl<'source> Parser<'source> {
                 SmallInt(n as i16)
             } else {
                 let n = if negate { -n } else { n };
-                if let Ok(constant_index) = self.constants.add_i64(n) {
+                if let Ok(constant_index) = self.constants.add_int(n) {
                     Int(constant_index)
                 } else {
                     return self.error(InternalError::ConstantPoolCapacityOverflow);
                 }
             }
-        } else if let Ok(n) = f64::from_str(&slice) {
+        } else if let Ok(n) = KFloat::from_str(&slice) {
             let n = if negate { -n } else { n };
-            if let Ok(constant_index) = self.constants.add_f64(n) {
+            if let Ok(constant_index) = self.constants.add_float(n) {
                 Float(constant_index)
             } else {
                 return self.error(InternalError::ConstantPoolCapacityOverflow);

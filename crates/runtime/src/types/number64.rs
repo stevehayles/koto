@@ -12,17 +12,22 @@ use std::{
 #[allow(missing_docs)]
 #[derive(Clone, Copy)]
 pub enum KNumber {
-    F64(f64),
-    I64(i64),
+    Float(f64),
+    Int(i64),
 }
 
 impl KNumber {
+    /// Returns NAN for the selected float size
+    pub fn nan() -> Self {
+        Self::Float(f64::NAN)
+    }
+
     /// Returns the absolute value of the number
     #[must_use]
     pub fn abs(self) -> Self {
         match self {
-            Self::F64(n) => Self::F64(n.abs()),
-            Self::I64(n) => Self::I64(n.abs()),
+            Self::Float(n) => Self::Float(n.abs()),
+            Self::Int(n) => Self::Int(n.abs()),
         }
     }
 
@@ -30,8 +35,8 @@ impl KNumber {
     #[must_use]
     pub fn ceil(self) -> Self {
         match self {
-            Self::F64(n) => Self::I64(n.ceil() as i64),
-            Self::I64(n) => Self::I64(n),
+            Self::Float(n) => Self::Int(n.ceil() as i64),
+            Self::Int(n) => Self::Int(n),
         }
     }
 
@@ -39,8 +44,8 @@ impl KNumber {
     #[must_use]
     pub fn floor(self) -> Self {
         match self {
-            Self::F64(n) => Self::I64(n.floor() as i64),
-            Self::I64(n) => Self::I64(n),
+            Self::Float(n) => Self::Int(n.floor() as i64),
+            Self::Int(n) => Self::Int(n),
         }
     }
 
@@ -50,24 +55,39 @@ impl KNumber {
     #[must_use]
     pub fn round(self) -> Self {
         match self {
-            Self::F64(n) => Self::I64(n.round() as i64),
-            Self::I64(n) => Self::I64(n),
+            Self::Float(n) => Self::Int(n.round() as i64),
+            Self::Int(n) => Self::Int(n),
         }
     }
 
     /// Returns true if the number is represented by an `f64`
+    pub fn is_float(self) -> bool {
+        self.is_f64()
+    }
+
+    /// Returns true if the number is represented by an `f64`
     pub fn is_f64(self) -> bool {
-        matches!(self, Self::F64(_))
+        matches!(self, Self::Float(_))
+    }
+
+    /// Returns true if the number is represented by an `i64`
+    pub fn is_int(self) -> bool {
+        self.is_i64()
     }
 
     /// Returns true if the number is represented by an `i64`
     pub fn is_i64(self) -> bool {
-        matches!(self, Self::I64(_))
+        matches!(self, Self::Int(_))
+    }
+
+    /// Returns true if the integer version of the number is representable by an `f64`
+    pub fn is_int_in_float_range(&self) -> bool {
+        self.is_i64_in_f64_range()
     }
 
     /// Returns true if the integer version of the number is representable by an `f64`
     pub fn is_i64_in_f64_range(&self) -> bool {
-        if let Self::I64(n) = *self {
+        if let Self::Int(n) = *self {
             (n as f64 as i64) == n
         } else {
             false
@@ -77,16 +97,16 @@ impl KNumber {
     /// Returns true if the number is not NaN or infinity
     pub fn is_finite(self) -> bool {
         match self {
-            Self::F64(n) => n.is_finite(),
-            Self::I64(_) => true,
+            Self::Float(n) => n.is_finite(),
+            Self::Int(_) => true,
         }
     }
 
     /// Returns true if the number is NaN
     pub fn is_nan(self) -> bool {
         match self {
-            Self::F64(n) => n.is_nan(),
-            Self::I64(_) => false,
+            Self::Float(n) => n.is_nan(),
+            Self::Int(_) => false,
         }
     }
 
@@ -99,18 +119,18 @@ impl KNumber {
         use KNumber::*;
 
         match (self, other) {
-            (F64(a), F64(b)) => F64(a.powf(b)),
-            (F64(a), I64(b)) => F64(a.powf(b as f64)),
-            (I64(a), F64(b)) => F64((a as f64).powf(b)),
-            (I64(a), I64(b)) => I64(a.pow(b as u32)),
+            (Float(a), Float(b)) => Float(a.powf(b)),
+            (Float(a), Int(b)) => Float(a.powf(b as f64)),
+            (Int(a), Float(b)) => Float((a as f64).powf(b)),
+            (Int(a), Int(b)) => Int(a.pow(b as u32)),
         }
     }
 
     /// Returns the value transmuted to a `u64`
     pub fn to_bits(self) -> u64 {
         match self {
-            Self::F64(n) => n.to_bits(),
-            Self::I64(n) => n as u64,
+            Self::Float(n) => n.to_bits(),
+            Self::Int(n) => n as u64,
         }
     }
 }
@@ -118,8 +138,8 @@ impl KNumber {
 impl fmt::Debug for KNumber {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            KNumber::F64(n) => write!(f, "Float({n})"),
-            KNumber::I64(n) => write!(f, "Int({n})"),
+            KNumber::Float(n) => write!(f, "Float({n})"),
+            KNumber::Int(n) => write!(f, "Int({n})"),
         }
     }
 }
@@ -127,7 +147,7 @@ impl fmt::Debug for KNumber {
 impl fmt::Display for KNumber {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            KNumber::F64(n) => {
+            KNumber::Float(n) => {
                 // Ensure that floats without fractional parts are rendered with a `.0` suffix
                 if n.fract() == 0.0 {
                     write!(f, "{n:.1}")
@@ -135,7 +155,7 @@ impl fmt::Display for KNumber {
                     write!(f, "{n}")
                 }
             }
-            KNumber::I64(n) => write!(f, "{n}"),
+            KNumber::Int(n) => write!(f, "{n}"),
         }
     }
 }
@@ -151,10 +171,10 @@ impl PartialEq for KNumber {
         use KNumber::*;
 
         match (self, other) {
-            (F64(a), F64(b)) => a == b,
-            (F64(a), I64(b)) => *a == *b as f64,
-            (I64(a), F64(b)) => *a as f64 == *b,
-            (I64(a), I64(b)) => a == b,
+            (Float(a), Float(b)) => a == b,
+            (Float(a), Int(b)) => *a == *b as f64,
+            (Int(a), Float(b)) => *a as f64 == *b,
+            (Int(a), Int(b)) => a == b,
         }
     }
 }
@@ -172,10 +192,10 @@ impl Ord for KNumber {
         use KNumber::*;
 
         let result = match (self, other) {
-            (F64(a), F64(b)) => a.partial_cmp(b),
-            (F64(a), I64(b)) => a.partial_cmp(&(*b as f64)),
-            (I64(a), F64(b)) => (*a as f64).partial_cmp(b),
-            (I64(a), I64(b)) => a.partial_cmp(b),
+            (Float(a), Float(b)) => a.partial_cmp(b),
+            (Float(a), Int(b)) => a.partial_cmp(&(*b as f64)),
+            (Int(a), Float(b)) => (*a as f64).partial_cmp(b),
+            (Int(a), Int(b)) => a.partial_cmp(b),
         };
 
         match result {
@@ -196,8 +216,8 @@ impl ops::Neg for KNumber {
         use KNumber::*;
 
         match self {
-            F64(n) => F64(-n),
-            I64(n) => I64(-n),
+            Float(n) => Float(-n),
+            Int(n) => Int(-n),
         }
     }
 }
@@ -209,8 +229,8 @@ impl ops::Neg for &KNumber {
         use KNumber::*;
 
         match *self {
-            F64(n) => F64(-n),
-            I64(n) => I64(-n),
+            Float(n) => Float(-n),
+            Int(n) => Int(-n),
         }
     }
 }
@@ -256,7 +276,7 @@ macro_rules! number_traits_float {
         $(
             impl From<$type> for KNumber {
                 fn from(n: $type) -> KNumber {
-                    KNumber::F64(n as f64)
+                    KNumber::Float(n as f64)
                 }
             }
             impl_from_knumber_ref!($type);
@@ -264,8 +284,8 @@ macro_rules! number_traits_float {
             impl From<KNumber> for $type {
                 fn from(n: KNumber) -> $type {
                     match n {
-                        KNumber::F64(f) => f as $type,
-                        KNumber::I64(i) => i as $type,
+                        KNumber::Float(f) => f as $type,
+                        KNumber::Int(i) => i as $type,
                     }
                 }
             }
@@ -275,8 +295,8 @@ macro_rules! number_traits_float {
                 fn eq(&self, b: &$type) -> bool {
                     let b = *b as f64;
                     match self {
-                        KNumber::F64(a) => *a == b,
-                        KNumber::I64(a) => *a as f64 == b,
+                        KNumber::Float(a) => *a == b,
+                        KNumber::Int(a) => *a as f64 == b,
                     }
                 }
             }
@@ -285,8 +305,8 @@ macro_rules! number_traits_float {
                 fn partial_cmp(&self, b: &$type) -> Option<Ordering> {
                     let b = *b as f64;
                     match self {
-                        KNumber::F64(a) => a.partial_cmp(&b),
-                        KNumber::I64(a) => (*a as f64).partial_cmp(&b),
+                        KNumber::Float(a) => a.partial_cmp(&b),
+                        KNumber::Int(a) => (*a as f64).partial_cmp(&b),
                     }
                 }
             }
@@ -300,7 +320,7 @@ macro_rules! number_traits_int {
             impl From<$type> for KNumber {
                 fn from(n: $type) -> KNumber {
                     use saturating_cast::SaturatingCast;
-                    KNumber::I64(n.saturating_cast())
+                    KNumber::Int(n.saturating_cast())
                 }
             }
             impl_from_knumber_ref!($type);
@@ -309,8 +329,8 @@ macro_rules! number_traits_int {
                 fn from(n: KNumber) -> $type {
                     use saturating_cast::SaturatingCast;
                     match n {
-                        KNumber::F64(f) => f as $type,
-                        KNumber::I64(i) => i.saturating_cast(),
+                        KNumber::Float(f) => f as $type,
+                        KNumber::Int(i) => i.saturating_cast(),
                     }
                 }
             }
@@ -320,8 +340,8 @@ macro_rules! number_traits_int {
                 fn eq(&self, b: &$type) -> bool {
                     let b = *b as i64;
                     match self {
-                        KNumber::F64(a) => (*a as i64) == b,
-                        KNumber::I64(a) => *a == b,
+                        KNumber::Float(a) => (*a as i64) == b,
+                        KNumber::Int(a) => *a == b,
                     }
                 }
             }
@@ -330,8 +350,8 @@ macro_rules! number_traits_int {
                 fn partial_cmp(&self, b: &$type) -> Option<Ordering> {
                     let b = *b as i64;
                     match self {
-                        KNumber::F64(a) => (*a as i64).partial_cmp(&b),
-                        KNumber::I64(a) => a.partial_cmp(&b),
+                        KNumber::Float(a) => (*a as i64).partial_cmp(&b),
+                        KNumber::Int(a) => a.partial_cmp(&b),
                     }
                 }
             }
@@ -353,10 +373,10 @@ macro_rules! number_op {
                 use KNumber::*;
 
                 match (self, other) {
-                    (F64(a), F64(b)) => F64(a $op b),
-                    (F64(a), I64(b)) => F64(a $op b as f64),
-                    (I64(a), F64(b)) => F64(a as f64 $op b),
-                    (I64(a), I64(b)) => I64(a $op b),
+                    (Float(a), Float(b)) => Float(a $op b),
+                    (Float(a), Int(b)) => Float(a $op b as f64),
+                    (Int(a), Float(b)) => Float(a as f64 $op b),
+                    (Int(a), Int(b)) => Int(a $op b),
                 }
             }
         }
@@ -368,10 +388,10 @@ macro_rules! number_op {
                 use KNumber::*;
 
                 match (*self, *other) {
-                    (F64(a), F64(b)) => F64(a $op b),
-                    (F64(a), I64(b)) => F64(a $op b as f64),
-                    (I64(a), F64(b)) => F64(a as f64 $op b),
-                    (I64(a), I64(b)) => I64(a $op b),
+                    (Float(a), Float(b)) => Float(a $op b),
+                    (Float(a), Int(b)) => Float(a $op b as f64),
+                    (Int(a), Float(b)) => Float(a as f64 $op b),
+                    (Int(a), Int(b)) => Int(a $op b),
                 }
             }
         }
@@ -390,10 +410,10 @@ impl ops::Div for KNumber {
         use KNumber::*;
 
         match (self, other) {
-            (F64(a), F64(b)) => F64(a / b),
-            (F64(a), I64(b)) => F64(a / b as f64),
-            (I64(a), F64(b)) => F64(a as f64 / b),
-            (I64(a), I64(b)) => F64(a as f64 / b as f64),
+            (Float(a), Float(b)) => Float(a / b),
+            (Float(a), Int(b)) => Float(a / b as f64),
+            (Int(a), Float(b)) => Float(a as f64 / b),
+            (Int(a), Int(b)) => Float(a as f64 / b as f64),
         }
     }
 }
@@ -405,10 +425,10 @@ impl ops::Div for &KNumber {
         use KNumber::*;
 
         match (*self, *other) {
-            (F64(a), F64(b)) => F64(a / b),
-            (F64(a), I64(b)) => F64(a / b as f64),
-            (I64(a), F64(b)) => F64(a as f64 / b),
-            (I64(a), I64(b)) => F64(a as f64 / b as f64),
+            (Float(a), Float(b)) => Float(a / b),
+            (Float(a), Int(b)) => Float(a / b as f64),
+            (Int(a), Float(b)) => Float(a as f64 / b),
+            (Int(a), Int(b)) => Float(a as f64 / b as f64),
         }
     }
 }

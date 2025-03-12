@@ -6,6 +6,8 @@ use std::{
     ops::{Range, RangeBounds},
 };
 
+use crate::KInt;
+
 /// The integer range type used by the Koto runtime
 ///
 /// See [`KValue::Range`]
@@ -16,10 +18,10 @@ pub struct KRange(Inner);
 enum Inner {
     Unbounded,
     From {
-        start: i64,
+        start: KInt,
     },
     To {
-        end: i64,
+        end: KInt,
         inclusive: bool,
     },
     Bounded {
@@ -28,18 +30,18 @@ enum Inner {
         inclusive: bool,
     },
     // Placing ranges with i64 bounds to the heap allows the size of KRange to be 16 bytes
-    BoundedLarge(Ptr<Bounded64>),
+    BoundedLarge(Ptr<BoundedKint>),
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct Bounded64 {
-    start: i64,
-    end: i64,
+struct BoundedKint {
+    start: KInt,
+    end: KInt,
     inclusive: bool,
 }
 
-impl From<Bounded64> for Inner {
-    fn from(range: Bounded64) -> Self {
+impl From<BoundedKint> for Inner {
+    fn from(range: BoundedKint) -> Self {
         Self::BoundedLarge(range.into())
     }
 }
@@ -52,7 +54,7 @@ impl KRange {
     ///
     /// `KRange` has an implementation of `From` for implementations of `RangeBounds` which might be
     /// simpler to use, e.g. `KRange::from(10..=20)`
-    pub fn new(start: Option<i64>, end: Option<(i64, bool)>) -> Self {
+    pub fn new(start: Option<KInt>, end: Option<(KInt, bool)>) -> Self {
         match (start, end) {
             (Some(start), Some((end, inclusive))) => {
                 match (i32::try_from(start), i32::try_from(end)) {
@@ -62,7 +64,7 @@ impl KRange {
                         inclusive,
                     }),
                     _ => Self(
-                        Bounded64 {
+                        BoundedKint {
                             start,
                             end,
                             inclusive,
@@ -78,11 +80,11 @@ impl KRange {
     }
 
     /// Returns the start of the range
-    pub fn start(&self) -> Option<i64> {
+    pub fn start(&self) -> Option<KInt> {
         use Inner::*;
         match &self.0 {
             From { start } => Some(*start),
-            Bounded { start, .. } => Some(*start as i64),
+            Bounded { start, .. } => Some(*start as KInt),
             BoundedLarge(r) => Some(r.start),
             _ => None,
         }
@@ -91,11 +93,11 @@ impl KRange {
     /// Returns the end of the range
     ///
     /// The return value includes flag stating whether or not the range end is inclusive or not.
-    pub fn end(&self) -> Option<(i64, bool)> {
+    pub fn end(&self) -> Option<(KInt, bool)> {
         use Inner::*;
         match &self.0 {
             To { end, inclusive } => Some((*end, *inclusive)),
-            Bounded { end, inclusive, .. } => Some((*end as i64, *inclusive)),
+            Bounded { end, inclusive, .. } => Some((*end as KInt, *inclusive)),
             BoundedLarge(r) => Some((r.end, r.inclusive)),
             _ => None,
         }
@@ -105,7 +107,7 @@ impl KRange {
     ///
     /// No clamping of the range boundaries is performed (as in [KRange::indices]),
     /// so negative indices will be preserved.
-    pub fn as_sorted_range(&self) -> Range<i64> {
+    pub fn as_sorted_range(&self) -> Range<KInt> {
         use Inner::*;
 
         let sort_bounded = |start, end, inclusive| {
@@ -118,15 +120,15 @@ impl KRange {
 
         let (start, end) = {
             match &self.0 {
-                From { start } => (*start, i64::MAX),
-                To { end, inclusive } => (i64::MIN, if *inclusive { *end + 1 } else { *end }),
+                From { start } => (*start, KInt::MAX),
+                To { end, inclusive } => (KInt::MIN, if *inclusive { *end + 1 } else { *end }),
                 Bounded {
                     start,
                     end,
                     inclusive,
-                } => sort_bounded(*start as i64, *end as i64, *inclusive),
+                } => sort_bounded(*start as KInt, *end as KInt, *inclusive),
                 BoundedLarge(r) => sort_bounded(r.start, r.end, r.inclusive),
-                Unbounded => (i64::MIN, i64::MAX),
+                Unbounded => (KInt::MIN, KInt::MAX),
             }
         };
 
@@ -135,7 +137,7 @@ impl KRange {
 
     /// Returns true if the provided number is within the range
     pub fn contains(&self, n: KNumber) -> bool {
-        let n: i64 = if n < 0.0 { n.floor() } else { n.ceil() }.into();
+        let n: KInt = if n < 0.0 { n.floor() } else { n.ceil() }.into();
         self.as_sorted_range().contains(&n)
     }
 
@@ -147,7 +149,7 @@ impl KRange {
     /// If the start value is `None` then the resulting start index will be `0`.
     /// If the end value is `None` then the resulting end index will be `max_index`.
     pub fn indices(&self, max_index: usize) -> Range<usize> {
-        let max_index = max_index as i64;
+        let max_index = max_index as KInt;
         let range = self.as_sorted_range();
         let start = range.start.clamp(0, max_index);
         let end = range.end.clamp(start, max_index);
@@ -203,7 +205,7 @@ impl KRange {
     /// This is used by RangeIterator and in the VM to iterate over temporary ranges.
     ///
     /// Returns an error if the range is not bounded.
-    pub fn pop_front(&mut self) -> Result<Option<i64>, Error> {
+    pub fn pop_front(&mut self) -> Result<Option<KInt>, Error> {
         use Inner::*;
         use Ordering::*;
 
@@ -214,18 +216,18 @@ impl KRange {
                 inclusive,
             } => match start.cmp(&end) {
                 Less => {
-                    let result = *start as i64;
+                    let result = *start as KInt;
                     *start += 1;
                     Some(result)
                 }
                 Greater => {
-                    let result = *start as i64;
+                    let result = *start as KInt;
                     *start -= 1;
                     Some(result)
                 }
                 Equal => {
                     if *inclusive {
-                        let result = *start as i64;
+                        let result = *start as KInt;
                         *inclusive = false; // Allow iteration to stop
                         Some(result)
                     } else {
@@ -268,7 +270,7 @@ impl KRange {
     /// This is used by RangeIterator and in the VM to iterate over temporary ranges.
     ///
     /// Returns an error if the range is not bounded.
-    pub fn pop_back(&mut self) -> Result<Option<i64>, Error> {
+    pub fn pop_back(&mut self) -> Result<Option<KInt>, Error> {
         use Inner::*;
         use Ordering::*;
 
@@ -279,18 +281,18 @@ impl KRange {
                 inclusive,
             } => match start.cmp(&end) {
                 Less => {
-                    let result = *end as i64;
+                    let result = *end as KInt;
                     *end -= 1;
                     Some(result)
                 }
                 Greater => {
-                    let result = *start as i64;
+                    let result = *start as KInt;
                     *start -= 1;
                     Some(result)
                 }
                 Equal => {
                     if *inclusive {
-                        let result = *start as i64;
+                        let result = *start as KInt;
                         *inclusive = false; // Allow iteration to stop
                         Some(result)
                     } else {
@@ -331,7 +333,7 @@ impl KRange {
 
 impl<R> From<R> for KRange
 where
-    R: RangeBounds<i64>,
+    R: RangeBounds<KInt>,
 {
     fn from(range: R) -> Self {
         use std::ops::Bound::*;
@@ -386,8 +388,8 @@ mod tests {
         assert_eq!(11..21, KRange::from(20..10).as_sorted_range());
         assert_eq!(10..21, KRange::from(20..=10).as_sorted_range());
 
-        assert_eq!(10..i64::MAX, KRange::from(10..).as_sorted_range(),);
-        assert_eq!(i64::MIN..10, KRange::from(..10).as_sorted_range(),);
+        assert_eq!(10..KInt::MAX, KRange::from(10..).as_sorted_range(),);
+        assert_eq!(KInt::MIN..10, KRange::from(..10).as_sorted_range(),);
     }
 
     #[test]
@@ -415,9 +417,22 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "num64")]
     fn bounded_large() {
         let start_big = 2_i64.pow(42);
         let end_big = 2_i64.pow(43);
+        assert!(KRange::from(start_big..end_big).is_ascending());
+        assert_eq!(
+            KRange::from(start_big..end_big).size().unwrap(),
+            (end_big - start_big) as usize
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "num32")]
+    fn bounded_large() {
+        let start_big = 2_i32.pow(42);
+        let end_big = 2_i32.pow(43);
         assert!(KRange::from(start_big..end_big).is_ascending());
         assert_eq!(
             KRange::from(start_big..end_big).size().unwrap(),

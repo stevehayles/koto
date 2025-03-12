@@ -3,7 +3,13 @@ use std::{iter::Peekable, str::Chars};
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::{ConstantIndex, constant_pool::ConstantPoolBuilder};
+use crate::ConstantIndex;
+
+#[cfg(feature = "num64")]
+use crate::constant_pool64::ConstantPoolBuilder;
+
+#[cfg(feature = "num32")]
+use crate::constant_pool32::ConstantPoolBuilder;
 
 /// The formatting options that are available for interpolated strings
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]

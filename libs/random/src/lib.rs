@@ -18,7 +18,7 @@ pub fn make_module() -> KMap {
             // No seed, make RNG from entropy
             [] => ChaCha8Rng::from_entropy(),
             // RNG from seed
-            [KValue::Number(n)] => ChaCha8Rng::seed_from_u64(n.to_bits()),
+            [KValue::Number(n)] => ChaCha8Rng::seed_from_u64(n.to_bits() as u64),
             unexpected => return unexpected_args("||, or |Number|", unexpected),
         };
 
@@ -143,7 +143,7 @@ impl ChaChaRng {
         use KValue::*;
         match args {
             [Number(n)] => {
-                self.0 = ChaCha8Rng::seed_from_u64(n.to_bits());
+                self.0 = ChaCha8Rng::seed_from_u64(n.to_bits() as u64);
                 Ok(Null)
             }
             unexpected => unexpected_args("|Number|", unexpected),

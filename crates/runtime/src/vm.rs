@@ -1,5 +1,5 @@
 use crate::{
-    DefaultStderr, DefaultStdin, DefaultStdout, KFunction, Ptr, Result,
+    DefaultStderr, DefaultStdin, DefaultStdout, KFunction, KInt, Ptr, Result,
     core_lib::CoreLib,
     error::{Error, ErrorKind},
     prelude::*,
@@ -733,11 +733,11 @@ impl KotoVm {
             SetBool { register, value } => self.set_register(register, value.into()),
             SetNumber { register, value } => self.set_register(register, value.into()),
             LoadFloat { register, constant } => {
-                let n = self.reader.chunk.constants.get_f64(constant);
+                let n = self.reader.chunk.constants.get_float(constant);
                 self.set_register(register, n.into());
             }
             LoadInt { register, constant } => {
-                let n = self.reader.chunk.constants.get_i64(constant);
+                let n = self.reader.chunk.constants.get_int(constant);
                 self.set_register(register, n.into());
             }
             LoadString { register, constant } => {
@@ -1337,11 +1337,11 @@ impl KotoVm {
             }
             Map(m) if m.contains_meta_key(&index_op) => {
                 let size = self.get_value_size(value)?;
-                let index = signed_index_to_unsigned(index, size) as i64;
+                let index = signed_index_to_unsigned(index, size) as KInt;
                 let range = if is_slice_to {
                     0..index
                 } else {
-                    index..size as i64
+                    index..size as KInt
                 };
                 self.run_binary_op(BinaryOp::Index, Map(m), KRange::from(range).into())?
             }
@@ -1359,11 +1359,11 @@ impl KotoVm {
             Object(o) => {
                 let o = o.try_borrow()?;
                 if let Some(size) = o.size() {
-                    let index = signed_index_to_unsigned(index, size) as i64;
+                    let index = signed_index_to_unsigned(index, size) as KInt;
                     let range = if is_slice_to {
                         0..index
                     } else {
-                        index..size as i64
+                        index..size as KInt
                     };
                     o.index(&KRange::from(range).into())?
                 } else {
@@ -1626,10 +1626,10 @@ impl KotoVm {
         let lhs_value = self.get_register(lhs);
         let rhs_value = self.get_register(rhs);
         let result_value = match (lhs_value, rhs_value) {
-            (Number(_), Number(KNumber::I64(b))) if *b == 0 => {
+            (Number(_), Number(KNumber::Int(b))) if *b == 0 => {
                 // Special case for integer remainder when the divisor is zero,
                 // avoid a panic and return NaN instead.
-                Number(f64::NAN.into())
+                Number(KNumber::nan())
             }
             (Number(a), Number(b)) => Number(a % b),
             (Map(m), _) if m.contains_meta_key(&Remainder.into()) => {
@@ -3140,7 +3140,7 @@ impl KotoVm {
                         StringFormatRepresentation::ExpUpper => format!("{n:E}"),
                     }
                 }
-                (Some(precision), None) if n.is_f64() || n.is_i64_in_f64_range() => {
+                (Some(precision), None) if n.is_float() || n.is_int_in_float_range() => {
                     format!("{:.*}", precision as usize, f64::from(n))
                 }
                 _ => n.to_string(),

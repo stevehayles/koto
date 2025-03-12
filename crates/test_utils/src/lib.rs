@@ -15,3 +15,9 @@ pub use output_capture::OutputCapture;
 pub use run_test_script::run_test_script;
 pub use script_instructions::script_instructions;
 pub use type_helpers::*;
+
+#[cfg(feature = "num64")]
+type KInt = i64;
+
+#[cfg(feature = "num32")]
+type KInt = i32;

@@ -6,12 +6,12 @@ mod objects {
     #[derive(Clone, Copy, Debug, KotoCopy, KotoType)]
     #[koto(use_copy)]
     struct TestObject {
-        x: i64,
+        x: KInt,
     }
 
     #[koto_impl(runtime = koto_runtime)]
     impl TestObject {
-        fn make_value(x: i64) -> KValue {
+        fn make_value(x: KInt) -> KValue {
             KObject::from(Self { x }).into()
         }
 
@@ -29,7 +29,7 @@ mod objects {
         fn absorb_values(&mut self, args: &[KValue]) -> Result<KValue> {
             for arg in args.iter() {
                 match arg {
-                    KValue::Number(n) => self.x += i64::from(n),
+                    KValue::Number(n) => self.x += KInt::from(n),
                     other => return unexpected_type("Number", other),
                 }
             }
@@ -59,7 +59,7 @@ mod objects {
                         Ok(Self::make_value($self.x $op rhs.x))
                     }
                     Number(n) => {
-                        Ok(Self::make_value($self.x $op i64::from(n)))
+                        Ok(Self::make_value($self.x $op KInt::from(n)))
                     }
                     unexpected => {
                         unexpected_type(&format!("a {} or Number", Self::type_static()), unexpected)
@@ -80,7 +80,7 @@ mod objects {
                         Ok(())
                     }
                     Number(n) => {
-                        $self.x $op i64::from(n);
+                        $self.x $op KInt::from(n);
                         Ok(())
                     }
                     unexpected => {
@@ -103,7 +103,7 @@ mod objects {
                     }
                     Number(n) => {
                         #[allow(clippy::float_cmp)]
-                        Ok($self.x $op i64::from(n))
+                        Ok($self.x $op KInt::from(n))
                     }
                     unexpected => {
                         unexpected_type(&format!("a {} or Number", Self::type_static()), unexpected)
@@ -131,7 +131,7 @@ mod objects {
         fn index(&self, index: &KValue) -> Result<KValue> {
             match index {
                 KValue::Number(index) => {
-                    let result = self.x + i64::from(index);
+                    let result = self.x + KInt::from(index);
                     Ok(result.into())
                 }
                 KValue::Range(range) => match (range.start(), range.end()) {
@@ -256,11 +256,11 @@ mod objects {
 
     #[derive(Clone, Debug, KotoCopy, KotoType)]
     struct TestIterator {
-        x: i64,
+        x: KInt,
     }
 
     impl TestIterator {
-        fn make_object(x: i64) -> KObject {
+        fn make_object(x: KInt) -> KObject {
             KObject::from(Self { x })
         }
     }

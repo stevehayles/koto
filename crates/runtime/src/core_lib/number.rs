@@ -1,5 +1,6 @@
 //! The `number` core library module
 
+use crate::KInt;
 use crate::prelude::*;
 
 /// Initializes the `number` core library module
@@ -50,7 +51,7 @@ pub fn make_module() -> KMap {
                 let expected_error = "|Number, Number|";
 
                 match ctx.instance_and_args(is_number, expected_error)? {
-                    (Number(a), [Number(b)]) => Ok((i64::from(a) $op i64::from(b)).into()),
+                    (Number(a), [Number(b)]) => Ok((KInt::from(a) $op KInt::from(b)).into()),
                     (instance, args) => {
                         unexpected_args_after_instance(expected_error, instance, args)
                     }

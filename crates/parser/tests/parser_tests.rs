@@ -198,7 +198,7 @@ null"#;
                     },
                 ],
                 Some(&[
-                    Constant::F64(1.0),
+                    Constant::KFloat(1.0),
                     Constant::Str("hello"),
                     Constant::Str("world"),
                     Constant::Str("a"),
@@ -207,6 +207,7 @@ null"#;
         }
 
         #[test]
+        #[cfg(feature = "num64")]
         fn number_notation() {
             let source = "
 1
@@ -234,7 +235,7 @@ null"#;
                         local_count: 0,
                     },
                 ],
-                Some(&[Constant::I64(256), Constant::I64(2880293630)]),
+                Some(&[Constant::KInt(256), Constant::KInt(2880293630)]),
             )
         }
 
@@ -374,7 +375,7 @@ null"#;
                         local_count: 0,
                     },
                 ],
-                Some(&[Constant::I64(456), Constant::Str("!")]),
+                Some(&[Constant::KInt(456), Constant::Str("!")]),
             )
         }
 
@@ -495,7 +496,11 @@ r##'#$bar'##
                         local_count: 0,
                     },
                 ],
-                Some(&[Constant::F64(-12.0), Constant::Str("a"), Constant::Str("x")]),
+                Some(&[
+                    Constant::KFloat(-12.0),
+                    Constant::Str("a"),
+                    Constant::Str("x"),
+                ]),
             )
         }
     }

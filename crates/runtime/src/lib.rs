@@ -30,3 +30,17 @@ pub use crate::{
 };
 pub use koto_derive as derive;
 pub use koto_memory::{Borrow, BorrowMut, KCell, Ptr, PtrMut, make_ptr, make_ptr_mut};
+
+#[cfg(feature = "num64")]
+/// A type alias for a 64-bit integer.
+pub type KInt = i64;
+#[cfg(feature = "num64")]
+/// A type alias for a 64-bit floating point number.
+pub type KFloat = f64;
+
+#[cfg(feature = "num32")]
+/// A type alias for a 32-bit integer.
+pub type KInt = i32;
+#[cfg(feature = "num32")]
+/// A type alias for a 32-bit floating point number.
+pub type KFloat = f32;

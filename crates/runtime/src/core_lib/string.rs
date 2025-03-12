@@ -205,13 +205,13 @@ pub fn make_module() -> KMap {
         match ctx.instance_and_args(is_string, expected_error)? {
             (KValue::Str(s), []) => {
                 let maybe_integer = if let Some(hex) = s.strip_prefix("0x") {
-                    i64::from_str_radix(hex, 16)
+                    KInt::from_str_radix(hex, 16)
                 } else if let Some(octal) = s.strip_prefix("0o") {
-                    i64::from_str_radix(octal, 8)
+                    KInt::from_str_radix(octal, 8)
                 } else if let Some(binary) = s.strip_prefix("0b") {
-                    i64::from_str_radix(binary, 2)
+                    KInt::from_str_radix(binary, 2)
                 } else {
-                    s.parse::<i64>()
+                    s.parse::<KInt>()
                 };
 
                 if let Ok(integer) = maybe_integer {
@@ -228,7 +228,7 @@ pub fn make_module() -> KMap {
                     return runtime_error!("number base must be within 2..=36");
                 }
 
-                if let Ok(result) = i64::from_str_radix(s, base) {
+                if let Ok(result) = KInt::from_str_radix(s, base) {
                     Ok(result.into())
                 } else {
                     Ok(KValue::Null)
