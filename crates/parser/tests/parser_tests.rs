@@ -1077,8 +1077,27 @@ min..max
         }
 
         #[test]
-        fn empty_tuple() {
-            let source = "(,)";
+        fn tuple_with_missing_value() {
+            let source = "8, , 5";
+            check_ast(
+                source,
+                &[
+                    SmallInt(8),
+                    Null,
+                    SmallInt(5),
+                    Tuple(nodes(&[0, 1, 2])),
+                    MainBlock {
+                        body: nodes(&[3]),
+                        local_count: 0,
+                    },
+                ],
+                None,
+            )
+        }
+
+        #[test]
+        fn empty_parentheses() {
+            let source = "()";
             check_ast(
                 source,
                 &[
@@ -1093,14 +1112,84 @@ min..max
         }
 
         #[test]
-        fn empty_parentheses_without_comma() {
-            let source = "()";
+        fn single_comma() {
+            let source = "(,)";
             check_ast(
                 source,
                 &[
                     Null,
+                    Tuple(nodes(&[0])),
                     MainBlock {
-                        body: nodes(&[0]),
+                        body: nodes(&[1]),
+                        local_count: 0,
+                    },
+                ],
+                None,
+            )
+        }
+
+        #[test]
+        fn two_commas() {
+            let source = "(,,)";
+            check_ast(
+                source,
+                &[
+                    Null,
+                    Null,
+                    Tuple(nodes(&[0, 1])),
+                    MainBlock {
+                        body: nodes(&[2]),
+                        local_count: 0,
+                    },
+                ],
+                None,
+            )
+        }
+
+        #[test]
+        fn nested_empty_tuple() {
+            let source = "(())";
+            check_ast(
+                source,
+                &[
+                    Tuple(nodes(&[])),
+                    Nested(0.into()),
+                    MainBlock {
+                        body: nodes(&[1]),
+                        local_count: 0,
+                    },
+                ],
+                None,
+            )
+        }
+
+        #[test]
+        fn empty_tuple_inside_tuple() {
+            let source = "((),)";
+            check_ast(
+                source,
+                &[
+                    Tuple(nodes(&[])),
+                    Tuple(nodes(&[0])),
+                    MainBlock {
+                        body: nodes(&[1]),
+                        local_count: 0,
+                    },
+                ],
+                None,
+            )
+        }
+
+        #[test]
+        fn single_entry_tuple() {
+            let source = "(1,)";
+            check_ast(
+                source,
+                &[
+                    SmallInt(1),
+                    Tuple(nodes(&[0])),
+                    MainBlock {
+                        body: nodes(&[1]),
                         local_count: 0,
                     },
                 ],
@@ -1135,23 +1224,6 @@ min..max
                     Tuple(nodes(&[0, 1, 2])),
                     MainBlock {
                         body: nodes(&[3]),
-                        local_count: 0,
-                    },
-                ],
-                None,
-            )
-        }
-
-        #[test]
-        fn single_entry_tuple() {
-            let source = "(1,)";
-            check_ast(
-                source,
-                &[
-                    SmallInt(1),
-                    Tuple(nodes(&[0])),
-                    MainBlock {
-                        body: nodes(&[1]),
                         local_count: 0,
                     },
                 ],
