@@ -12,11 +12,6 @@ mod tuple;
 pub mod value;
 mod value_key;
 
-#[cfg(feature = "arc")]
-mod arc;
-#[cfg(feature = "arc")]
-pub use crate::arc::*;
-
 #[cfg(feature = "num32")]
 mod number32;
 #[cfg(feature = "num32")]
