@@ -32,7 +32,7 @@ check! Rect{x: 0, y: 0, width: 0, height: 0}
 print! rect 10, 20, 30, 40
 check! Rect{x: 10, y: 20, width: 30, height: 40}
 
-print! rect (vec2 -1, 2), (vec2 99, 100)
+print! rect vec2(-1, 2), vec2(99, 100)
 check! Rect{x: -1, y: 2, width: 99, height: 100}
 ```
 
@@ -114,16 +114,16 @@ check! Vec3{x: -1, y: 3, z: 0}
 print! vec3 10, 20, 30
 check! Vec3{x: 10, y: 20, z: 30}
 
-print! vec3 (vec2 -1, -2), 5
+print! vec3 vec2(-1, -2), 5
 check! Vec3{x: -1, y: -2, z: 5}
 ```
 
 ## Rect
 
-The `Rect` type represents a 2-dimensional rectangle, 
-with a defined position and size. 
+The `Rect` type represents a 2-dimensional rectangle,
+with a defined position and size.
 
-The position is interpreted as being at the center of the rectangle. 
+The position is interpreted as being at the center of the rectangle.
 
 Comparison operations are available, and the rect's components are iterable.
 
@@ -333,23 +333,23 @@ check! Rect{x: 0, y: 0, width: 200, height: 200}
 
 The `Vec2` type represents a 2-dimensional vector, with `x` and `y` coordinates.
 
-All operators are implemented, and the vector's coordinates are iterable.
+Arithmetic operations are supported, and the vector's coordinates are iterable.
 
 ### Example
 
 ```koto
 from geometry import vec2
 
-print! (vec2 10, 20) + (vec2 30, 40)
+print! vec2(10, 20) + vec2(30, 40)
 check! Vec2{x: 40, y: 60}
 
 v = vec2 50, 100
-v *= vec2 0.5, 2
+v *= 2 * vec2 0.5, 2
 x, y = v
 print! x, y
-check! (25.0, 200.0)
-print! v -= 50
-check! Vec2{x: -25, y: 150}
+check! (50.0, 400.0)
+print! v -= 100
+check! Vec2{x: -50, y: 300}
 ```
 
 ## Vec2.angle
@@ -365,13 +365,13 @@ Returns the angle of the vector, expressed in radians.
 ```koto
 from geometry import vec2
 
-print! (vec2 1, 0).angle()
+print! vec2(1, 0).angle()
 check! 0.0
-print '{(vec2 0, 1).angle():.3}'
+print '{vec2(0, 1).angle():.3}'
 check! 1.571
-print '{(vec2 -1, 0).angle():.3}'
+print '{vec2(-1, 0).angle():.3}'
 check! 3.142
-print '{(vec2 0, -1).angle():.3}'
+print '{vec2(0, -1).angle():.3}'
 check! -1.571
 ```
 
@@ -388,67 +388,73 @@ Returns the length of the vector.
 ```koto
 from geometry import vec2
 
-print! (vec2 0, 0).length()
+print! vec2(0, 0).length()
 check! 0.0
-print! (vec2 3, 4).length()
+print! vec2(3, 4).length()
 check! 5.0
-print! (vec2 -4, -3).length()
+print! vec2(-4, -3).length()
 check! 5.0
 ```
 
 ## Vec2.x
 
 ```kototype
-|Vec2| -> Number
+Number
 ```
 
-Returns the `x` coordinate of the vector.
+The `x` coordinate of the vector.
 
 ### Example
 
 ```koto
 from geometry import vec2
 
-print! (vec2 -1, 0).x()
+v = vec2 -1, 0
+print! v.x
 check! -1.0
-print! (vec2 3, 4).x()
-check! 3.0
+
+v.x = 99
+print! v
+check! Vec2{x: 99, y: 0}
 ```
 
 ## Vec2.y
 
 ```kototype
-|Vec2| -> Number
+Number
 ```
 
-Returns the `y` coordinate of the vector.
+The `y` coordinate of the vector.
 
 ### Example
 
 ```koto
 from geometry import vec2
 
-print! (vec2 0, -2).y()
-check! -2.0
-print! (vec2 3, 4).y()
-check! 4.0
+v = vec2 0, 2
+print! v.y
+check! 2.0
+
+v.y = 100
+print! v
+check! Vec2{x: 0, y: 100}
 ```
 
 ## Vec3
 
 The `Vec3` type represents a 3-dimensional vector, with `x`, `y`, and `z` coordinates.
 
-All operators are implemented, and the vector's coordinates are iterable.
+Arithmetic operations are supported, and the vector's coordinates are iterable.
 
 ### Example
 
 ```koto
 from geometry import vec3
 
-print! (vec3 10, 20, 30) + (vec3 40, 50, 60)
+print! vec3(10, 20, 30) + vec3(40, 50, 60)
 check! Vec3{x: 50, y: 70, z: 90}
 
-v = vec3 50, 100, 150
+v = 10 * vec3 5, 10, 15
 v *= vec3 0.5, 2, -1
 x, y, z = v
 print! x, y, z
@@ -458,53 +464,67 @@ check! (25.0, 200.0, -150.0)
 ## Vec3.x
 
 ```kototype
-|Vec3| -> Number
+Number
 ```
 
-Returns the `x` coordinate of the vector.
+The `x` coordinate of the vector.
 
 ### Example
 
 ```koto
 from geometry import vec3
 
-print! (vec3 -1, 0, 1).x()
-check! -1.0
-```
+v = vec3 1, 2, 3
+print! v.x
+check! 1.0
 
+v.x = 99
+print! v
+check! Vec3{x: 99, y: 2, z: 3}
+```
 
 ## Vec3.y
 
 ```kototype
-|Vec3| -> Number
+Number
 ```
 
-Returns the `y` coordinate of the vector.
+The `y` coordinate of the vector.
 
 ### Example
 
 ```koto
 from geometry import vec3
 
-print! (vec3 -1, -2, -3).y()
-check! -2.0
+v = vec3 1, 2, 3
+print! v.y
+check! 2.0
+
+v.y = 99
+print! v
+check! Vec3{x: 1, y: 99, z: 3}
 ```
 
 ## Vec3.z
 
 ```kototype
-|Vec3| -> Number
+Number
 ```
 
-Returns the `z` coordinate of the vector.
+The `z` coordinate of the vector.
 
 ### Example
 
 ```koto
 from geometry import vec3
 
-print! (vec3 10, 20, 30).z()
-check! 30.0
+v = vec3 1, 2, 3
+print! v.z
+check! 3.0
+
+v.z = 99
+print! v
+check! Vec3{x: 1, y: 2, z: 99}
 ```
 
 ## Vec3.length
@@ -520,8 +540,8 @@ Returns the length of the vector.
 ```koto
 from geometry import vec3
 
-print! (vec3 0, 0, 10).length()
+print! vec3(0, 0, 10).length()
 check! 10.0
-print! (vec3 1, 2, 2).length()
+print! vec3(1, 2, 2).length()
 check! 3.0
 ```

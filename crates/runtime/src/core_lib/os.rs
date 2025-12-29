@@ -13,6 +13,13 @@ pub fn make_module() -> KMap {
 
     let result = KMap::with_type("core.os");
 
+    result.insert("args", KValue::Tuple(KTuple::default()));
+
+    result.add_fn("env", |ctx| match ctx.args() {
+        [KValue::Str(key)] => Ok(std::env::var(key.as_str()).ok().into()),
+        unexpected => unexpected_args("|String|", unexpected),
+    });
+
     result.add_fn("command", |ctx| match ctx.args() {
         [KValue::Str(command)] => Ok(Command::make_value(command)),
         unexpected => unexpected_args("|String|", unexpected),
@@ -58,6 +65,7 @@ pub fn make_module() -> KMap {
 
 /// The underlying data type returned by `os.time()`
 #[derive(Clone, Debug, KotoCopy, KotoType)]
+#[koto(runtime = crate)]
 pub struct DateTime(chrono::DateTime<FixedOffset>);
 
 #[koto_impl(runtime = crate)]
@@ -151,6 +159,7 @@ impl KotoObject for DateTime {
 
 /// The underlying data type returned by `os.start_timer()`
 #[derive(Clone, Debug, KotoCopy, KotoType)]
+#[koto(runtime = crate)]
 pub struct Timer(Instant);
 
 #[koto_impl(runtime = crate)]
@@ -176,15 +185,15 @@ impl KotoObject for Timer {
         Ok(())
     }
 
-    fn subtract(&self, rhs: &KValue) -> Result<KValue> {
-        match rhs {
+    fn subtract(&self, other: &KValue) -> Result<KValue> {
+        match other {
             KValue::Object(o) if o.is_a::<Self>() => {
-                let rhs = o.cast::<Self>().unwrap();
+                let other_timer = o.cast::<Self>().unwrap();
 
-                let result = if self.0 >= rhs.0 {
-                    self.0.duration_since(rhs.0).as_secs_f64()
+                let result = if self.0 >= other_timer.0 {
+                    self.0.duration_since(other_timer.0).as_secs_f64()
                 } else {
-                    -(rhs.0.duration_since(self.0).as_secs_f64())
+                    -(other_timer.0.duration_since(self.0).as_secs_f64())
                 };
 
                 Ok(result.into())

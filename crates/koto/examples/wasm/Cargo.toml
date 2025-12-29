@@ -1,6 +1,6 @@
 [package]
 name = "koto_wasm"
-version = "0.16.0"
+version = "0.17.0"
 publish = false
 
 authors.workspace = true
@@ -11,8 +11,7 @@ license.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-koto = { path = "../../" }
-
+koto = { workspace = true, features = ["rc"] }
 wasm-bindgen = { workspace = true }
 
 [dev-dependencies]

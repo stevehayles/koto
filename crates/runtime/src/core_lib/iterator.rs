@@ -12,6 +12,28 @@ static MODULE_NAME: &str = "core.iterator";
 pub fn make_module() -> KMap {
     let result = KMap::with_type(MODULE_NAME);
 
+    result.add_fn("advance", |ctx| {
+        let expected_error = "|Iterator, Number >= 0|";
+
+        match ctx.instance_and_args(KValue::is_iterable, expected_error)? {
+            (KValue::Iterator(iterator), [KValue::Number(n)]) if *n >= 0.0 => {
+                let mut iterator = iterator.clone();
+                let mut remaining = usize::from(n);
+
+                while remaining > 0 {
+                    match iterator.next() {
+                        Some(Output::Error(error)) => return Err(error),
+                        Some(_) => remaining -= 1,
+                        None => break,
+                    }
+                }
+
+                Ok(remaining.into())
+            }
+            (instance, args) => unexpected_args_after_instance(expected_error, instance, args),
+        }
+    });
+
     result.add_fn("all", |ctx| {
         let expected_error = "|Iterable, |Any| -> Bool|";
 
@@ -198,11 +220,7 @@ pub fn make_module() -> KMap {
             (iterable, [f]) if f.is_callable() => {
                 let iterable = iterable.clone();
                 let f = f.clone();
-                let result = adaptors::Each::new(
-                    ctx.vm.make_iterator(iterable)?,
-                    f,
-                    ctx.vm.spawn_shared_vm(),
-                );
+                let result = adaptors::Each::new(ctx.vm.make_iterator(iterable)?, f, ctx.vm);
 
                 Ok(KIterator::new(result).into())
             }
@@ -266,10 +284,7 @@ pub fn make_module() -> KMap {
         match ctx.instance_and_args(KValue::is_iterable, expected_error)? {
             (iterable, []) => {
                 let iterable = iterable.clone();
-                let result = adaptors::Flatten::new(
-                    ctx.vm.make_iterator(iterable)?,
-                    ctx.vm.spawn_shared_vm(),
-                );
+                let result = adaptors::Flatten::new(ctx.vm.make_iterator(iterable)?, ctx.vm);
 
                 Ok(KIterator::new(result).into())
             }
@@ -325,16 +340,15 @@ pub fn make_module() -> KMap {
 
         match ctx.args() {
             [f] if f.is_callable() => {
-                let result = generators::Generate::new(f.clone(), ctx.vm.spawn_shared_vm());
+                let result = generators::Generate::new(f.clone(), ctx.vm);
                 Ok(KIterator::new(result).into())
             }
-            [KValue::Number(n), f] if f.is_callable() => {
-                let result =
-                    generators::GenerateN::new(n.into(), f.clone(), ctx.vm.spawn_shared_vm());
+            [f, KValue::Number(n)] if *n >= 0 && f.is_callable() => {
+                let result = generators::GenerateN::new(n.into(), f.clone(), ctx.vm);
                 Ok(KIterator::new(result).into())
             }
             unexpected => unexpected_args(
-                "|generator: || -> Any|, or |n: Number, generator: || -> Any|",
+                "|generator: || -> Any|, or |generator: || -> Any, n: Number >= 0|",
                 unexpected,
             ),
         }
@@ -350,7 +364,7 @@ pub fn make_module() -> KMap {
                 let result = adaptors::IntersperseWith::new(
                     ctx.vm.make_iterator(iterable)?,
                     separator_fn,
-                    ctx.vm.spawn_shared_vm(),
+                    ctx.vm,
                 );
 
                 Ok(KIterator::new(result).into())
@@ -385,11 +399,8 @@ pub fn make_module() -> KMap {
             (iterable, [predicate]) if predicate.is_callable() => {
                 let iterable = iterable.clone();
                 let predicate = predicate.clone();
-                let result = adaptors::Keep::new(
-                    ctx.vm.make_iterator(iterable)?,
-                    predicate,
-                    ctx.vm.spawn_shared_vm(),
-                );
+                let result =
+                    adaptors::Keep::new(ctx.vm.make_iterator(iterable)?, predicate, ctx.vm);
                 Ok(KIterator::new(result).into())
             }
             (instance, args) => unexpected_args_after_instance(expected_error, instance, args),
@@ -653,15 +664,11 @@ pub fn make_module() -> KMap {
                 let result = generators::Repeat::new(value.clone());
                 Ok(KIterator::new(result).into())
             }
-            [value, KValue::Number(n)] => {
-                if *n >= 0.0 {
-                    let result = generators::RepeatN::new(value.clone(), n.into());
-                    Ok(KIterator::new(result).into())
-                } else {
-                    runtime_error!("expected a non-negative number")
-                }
+            [value, KValue::Number(n)] if *n >= 0.0 => {
+                let result = generators::RepeatN::new(value.clone(), n.into());
+                Ok(KIterator::new(result).into())
             }
-            unexpected => unexpected_args("|Any|, or |Number, Any|", unexpected),
+            unexpected => unexpected_args("|Any|, or |Any, Number >= 0|", unexpected),
         }
     });
 
@@ -681,25 +688,14 @@ pub fn make_module() -> KMap {
     });
 
     result.add_fn("skip", |ctx| {
-        let expected_error = "|Iterable, Number|";
+        let expected_error = "|Iterable, Number >= 0|";
 
         match ctx.instance_and_args(KValue::is_iterable, expected_error)? {
-            (iterable, [KValue::Number(n)]) => {
-                if *n >= 0.0 {
-                    let iterable = iterable.clone();
-                    let n = *n;
-                    let mut iter = ctx.vm.make_iterator(iterable)?;
-
-                    for _ in 0..n.into() {
-                        if let Some(Output::Error(error)) = iter.next() {
-                            return Err(error);
-                        }
-                    }
-
-                    Ok(KValue::Iterator(iter))
-                } else {
-                    runtime_error!("expected a non-negative number")
-                }
+            (iterable, [KValue::Number(n)]) if *n >= 0.0 => {
+                let iterable = iterable.clone();
+                let n = *n;
+                let result = adaptors::Skip::new(ctx.vm.make_iterator(iterable)?, n.into());
+                Ok(KIterator::new(result).into())
             }
             (instance, args) => unexpected_args_after_instance(expected_error, instance, args),
         }
@@ -742,7 +738,7 @@ pub fn make_module() -> KMap {
     });
 
     result.add_fn("take", |ctx| {
-        let expected_error = "|Iterable, Number|, or |Iterable, |Any| -> Bool|";
+        let expected_error = "|Iterable, Number >= 0|, or |Iterable, |Any| -> Bool|";
 
         match ctx.instance_and_args(KValue::is_iterable, expected_error)? {
             (iterable, [KValue::Number(n)]) if *n >= 0.0 => {
@@ -754,11 +750,8 @@ pub fn make_module() -> KMap {
             (iterable, [predicate]) if predicate.is_callable() => {
                 let iterable = iterable.clone();
                 let predicate = predicate.clone();
-                let result = adaptors::TakeWhile::new(
-                    ctx.vm.make_iterator(iterable)?,
-                    predicate,
-                    ctx.vm.spawn_shared_vm(),
-                );
+                let result =
+                    adaptors::TakeWhile::new(ctx.vm.make_iterator(iterable)?, predicate, ctx.vm);
                 Ok(KIterator::new(result).into())
             }
             (instance, args) => unexpected_args_after_instance(expected_error, instance, args),
@@ -926,6 +919,7 @@ pub(crate) fn iter_output_to_result(iterator_output: Option<Output>) -> Result<O
 
 /// The output type used by operations like `iterator.next()` and `next_back()`
 #[derive(Clone, KotoCopy, KotoType)]
+#[koto(runtime = crate)]
 pub struct IteratorOutput(KValue);
 
 #[koto_impl(runtime = crate)]

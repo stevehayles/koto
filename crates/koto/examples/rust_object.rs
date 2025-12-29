@@ -1,12 +1,12 @@
-use koto::{derive::*, prelude::*, runtime};
+use koto::{Result, derive::*, prelude::*, runtime};
 
-fn main() {
+fn main() -> Result<()> {
     let script = "
 my_type = make_my_type 41
 print my_type.get()
 print my_type.set 99
 ";
-    let mut koto = Koto::default();
+    let mut koto = Koto::with_settings(KotoSettings::default().inherit_io());
 
     koto.prelude()
         .add_fn("make_my_type", |ctx| match ctx.args() {
@@ -14,7 +14,9 @@ print my_type.set 99
             unexpected => unexpected_args("|Number|", unexpected),
         });
 
-    koto.compile_and_run(script).unwrap();
+    koto.compile_and_run(script)?;
+
+    Ok(())
 }
 
 // MyType is a type that we want to use in Koto
@@ -23,7 +25,7 @@ print my_type.set 99
 #[derive(Clone, Copy, KotoCopy, KotoType)]
 struct MyType(i64);
 
-// The KotoEntries trait is implemented by the koto_impl macro,
+// The KotoAccess trait is implemented by the koto_impl macro,
 // generating Koto functions for any impl function tagged with #[koto_method],
 // and inserting them into a cached KMap.
 #[koto_impl]
@@ -36,20 +38,15 @@ impl MyType {
 
     // A simple getter function
     #[koto_method]
-    fn get(&self) -> runtime::Result<KValue> {
-        Ok(self.0.into())
+    fn get(&self) -> i64 {
+        self.0
     }
 
     // A function that returns the object instance as the result
     #[koto_method]
-    fn set(ctx: MethodContext<Self>) -> runtime::Result<KValue> {
-        match ctx.args {
-            [KValue::Number(n)] => {
-                ctx.instance_mut()?.0 = n.into();
-                ctx.instance_result()
-            }
-            unexpected => unexpected_args("|Number|", unexpected),
-        }
+    fn set(&mut self, n: i64) -> &mut Self {
+        self.0 = n;
+        self
     }
 }
 

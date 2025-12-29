@@ -1,7 +1,9 @@
-use koto::prelude::*;
+use koto::{Result, prelude::*};
 
-fn main() {
-    Koto::default()
-        .compile_and_run("print 'Hello, World!'")
-        .unwrap();
+fn main() -> Result<()> {
+    let script = "print 'Hello, World!'";
+
+    Koto::with_settings(KotoSettings::default().inherit_io()).compile_and_run(script)?;
+
+    Ok(())
 }

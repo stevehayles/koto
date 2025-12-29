@@ -1,6 +1,9 @@
 //! The `io` core library module
 
-use crate::{BufferedFile, Error, Ptr, Result, derive::*, prelude::*};
+use crate::{
+    BufferedFile, Error, Ptr, Result, UnavailableStderr, UnavailableStdin, UnavailableStdout,
+    derive::*, prelude::*,
+};
 use std::{
     fmt, fs,
     io::{self, BufRead, Read, Seek, SeekFrom, Write},
@@ -126,18 +129,9 @@ pub fn make_module() -> KMap {
         }
     });
 
-    result.add_fn("stderr", |ctx| match ctx.args() {
-        [] => Ok(File::stderr(ctx.vm)),
-        unexpected => unexpected_args("||", unexpected),
-    });
-    result.add_fn("stdin", |ctx| match ctx.args() {
-        [] => Ok(File::stdin(ctx.vm)),
-        unexpected => unexpected_args("||", unexpected),
-    });
-    result.add_fn("stdout", |ctx| match ctx.args() {
-        [] => Ok(File::stdout(ctx.vm)),
-        unexpected => unexpected_args("||", unexpected),
-    });
+    result.insert("stdin", File::new(make_ptr!(UnavailableStdin::default())));
+    result.insert("stdout", File::new(make_ptr!(UnavailableStdout::default())));
+    result.insert("stderr", File::new(make_ptr!(UnavailableStderr::default())));
 
     result.add_fn("temp_dir", |ctx| match ctx.args() {
         [] => Ok(std::env::temp_dir().to_string_lossy().as_ref().into()),
@@ -149,6 +143,7 @@ pub fn make_module() -> KMap {
 
 /// The File type used in the io module
 #[derive(Clone, KotoCopy, KotoType)]
+#[koto(runtime = crate)]
 pub struct File(Ptr<dyn KotoFile>);
 
 #[koto_impl(runtime = crate)]
@@ -166,31 +161,19 @@ impl File {
         Self(make_ptr!(BufferedSystemFile::new(file, path))).into()
     }
 
-    fn stderr(vm: &KotoVm) -> KValue {
-        Self(vm.stderr().clone()).into()
-    }
-
-    fn stdin(vm: &KotoVm) -> KValue {
-        Self(vm.stdin().clone()).into()
-    }
-
-    fn stdout(vm: &KotoVm) -> KValue {
-        Self(vm.stdout().clone()).into()
+    #[koto_method]
+    fn flush(&mut self) -> Result<()> {
+        self.0.flush()
     }
 
     #[koto_method]
-    fn flush(&mut self) -> Result<KValue> {
-        self.0.flush().map(|_| KValue::Null)
+    fn is_terminal(&self) -> bool {
+        self.0.is_terminal()
     }
 
     #[koto_method]
-    fn is_terminal(&self) -> KValue {
-        self.0.is_terminal().into()
-    }
-
-    #[koto_method]
-    fn path(&self) -> Result<KValue> {
-        self.0.path().map(KValue::from)
+    fn path(&self) -> Result<KString> {
+        self.0.path()
     }
 
     #[koto_method]
@@ -209,8 +192,8 @@ impl File {
     }
 
     #[koto_method]
-    fn read_to_string(&mut self) -> Result<KValue> {
-        self.0.read_to_string().map(KValue::from)
+    fn read_to_string(&mut self) -> Result<String> {
+        self.0.read_to_string()
     }
 
     #[koto_method]

@@ -57,8 +57,8 @@ assert_near 2.acosh(), 1.3169578969248166
 |Number, Number| -> Number
 ```
 
-Returns the bitwise combination of the binary representations of two numbers, 
-where a `1` in both of the inputs produces a `1` in the corresponding output 
+Returns the bitwise combination of the binary representations of two numbers,
+where a `1` in both of the inputs produces a `1` in the corresponding output
 position.
 
 ### Note
@@ -280,7 +280,7 @@ Provides the `e` constant.
 ```
 
 Returns the result of applying the exponential function,
-equivalent to calling `e.pow x`.
+equivalent to calling `e ^ x`.
 
 ### Example
 
@@ -296,7 +296,7 @@ assert_eq 1.exp(), number.e
 ```
 
 Returns the result of applying the base-2 exponential function,
-equivalent to calling `2.pow x`.
+equivalent to calling `2 ^ x`.
 
 ### Example
 
@@ -358,6 +358,29 @@ Number
 
 Provides the `∞` constant.
 
+## is_int
+
+```kototype
+|Number| -> Bool
+```
+
+Returns true if the number is an integer.
+
+### Example
+
+```koto
+print! 1.is_int()
+check! true
+
+print! 1.5.is_int()
+check! false
+```
+
+### See Also
+
+- [`number.is_nan`](#is-nan)
+- [`number.to_int`](#to-int)
+
 ## is_nan
 
 ```kototype
@@ -375,6 +398,10 @@ check! false
 print! (0 / 0).is_nan()
 check! true
 ```
+
+### See Also
+
+- [`number.is_int`](#is-int)
 
 ## lerp
 
@@ -523,8 +550,8 @@ Provides the `-∞` constant.
 |Number, Number| -> Number
 ```
 
-Returns the bitwise combination of the binary representations of two numbers, 
-where a `1` in either of the inputs produces a `1` in the corresponding output 
+Returns the bitwise combination of the binary representations of two numbers,
+where a `1` in either of the inputs produces a `1` in the corresponding output
 position.
 
 ### Note
@@ -562,21 +589,6 @@ Number
 ```
 
 Provides the `π` constant divided by `4`.
-
-## pow
-
-```kototype
-|Number, Number| -> Number
-```
-
-Returns the result of raising the first number to the power of the second.
-
-### Example
-
-```koto
-print! 2.pow 3
-check! 8
-```
 
 ## radians
 
@@ -805,6 +817,7 @@ check! -1
 
 - [`number.ceil`](#ceil)
 - [`number.floor`](#floor)
+- [`number.is_int`](#is-int)
 - [`number.round`](#round)
 
 ## xor

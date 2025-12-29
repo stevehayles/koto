@@ -41,7 +41,7 @@ impl TryFrom<usize> for ConstantIndex {
 
 impl fmt::Display for ConstantIndex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        self.0.fmt(f)
     }
 }
 
@@ -103,7 +103,7 @@ impl ConstantPool {
     }
 
     /// Returns the constant corresponding to the provided index
-    pub fn get(&self, index: usize) -> Option<Constant> {
+    pub fn get(&self, index: usize) -> Option<Constant<'_>> {
         match self.constants.get(index) {
             Some(constant_info) => match constant_info {
                 ConstantEntry::F64(n) => Some(Constant::F64(*n)),
@@ -165,7 +165,7 @@ impl ConstantPool {
     }
 
     /// Provides an iterator that iterates over the pool's constants
-    pub fn iter(&self) -> ConstantPoolIterator {
+    pub fn iter(&self) -> ConstantPoolIterator<'_> {
         ConstantPoolIterator::new(self)
     }
 }

@@ -59,15 +59,19 @@ pub enum Node {
     /// A tuple literal
     ///
     /// E.g. `(foo, bar, 42)`
-    ///
-    /// Note that this is also used for implicit tuples, e.g. in `x = 1, 2, 3`
-    Tuple(AstVec<AstIndex>),
+    Tuple {
+        /// The tuple's elements
+        elements: AstVec<AstIndex>,
+        /// Whether or not parentheses were used for the tuple
+        parentheses: bool,
+    },
 
     /// A temporary tuple
     ///
-    /// Used in contexts where the result won't be exposed directly to the use, e.g.
-    /// `x, y = 1, 2` - here `x` and `y` are indexed from the temporary tuple.
-    /// `match foo, bar...` - foo and bar will be stored in a temporary tuple for comparison.
+    /// Used in contexts where the result won't be exposed directly to the user,
+    /// e.g.
+    /// - `x, y = 1, 2`: x and y are indexed from the temporary tuple.
+    /// - `match foo, bar...`: foo and bar will be stored in a temporary tuple for comparison.
     TempTuple(AstVec<AstIndex>),
 
     /// A range with a defined start and end
@@ -102,12 +106,37 @@ pub enum Node {
     /// Used when indexing a list or tuple, and the full contents are to be returned.
     RangeFull,
 
-    /// A map literal, with a series of keys and values
+    /// A map literal, containing a series of key/value entries
+    Map {
+        /// The map's entries.
+        ///
+        /// If the map has braces, then values are optional and the valueless keys will point
+        /// directly to an Id instead of a MapEntry.
+        entries: AstVec<AstIndex>,
+        /// Whether or not the map was defined using braces.
+        braces: bool,
+    },
+
+    /// A key/value pair representing a Map entry.
     ///
     /// Keys will either be Id, String, or Meta nodes.
-    ///
-    /// Values are optional for inline maps.
-    Map(AstVec<(AstIndex, Option<AstIndex>)>),
+    MapEntry(AstIndex, AstIndex),
+
+    /// A map pattern, on the left hand side of an assignment or as a match pattern
+    MapPattern {
+        /// The map patterns entries.
+        entries: AstVec<AstIndex>,
+        /// An optional type hint.
+        type_hint: Option<AstIndex>,
+    },
+
+    /// A key rebinding inside a [Self::Map] or [Self::MapPattern], e.g. `key as id`
+    MapKeyRebind {
+        /// The map key on the left hand side
+        key: AstIndex,
+        /// The id or ignored on the right hand side
+        id_or_ignored: AstIndex,
+    },
 
     /// The `self` keyword
     Self_,
@@ -134,6 +163,16 @@ pub enum Node {
     /// A function node
     Function(Function),
 
+    /// A function's arguments
+    FunctionArgs {
+        /// The arguments
+        args: AstVec<AstIndex>,
+        /// A flag that indicates if the function arguments end with a variadic `...` argument
+        variadic: bool,
+        /// The optional output type of the function
+        output_type: Option<AstIndex>,
+    },
+
     /// An import expression
     ///
     /// E.g. `from foo.bar import baz, 'qux'`
@@ -143,6 +182,10 @@ pub enum Node {
         /// An empty list here implies that import without `from` has been used.
         from: AstVec<AstIndex>,
         /// The series of items to import
+        // The import items are stored in a `Vec` here rather than an `AstVec` to avoid bloating the
+        // overall size of `Node`.
+        ///
+        /// An empty list here implies that a `*` wildcard import was used.
         items: Vec<ImportItem>,
     },
 
@@ -159,6 +202,8 @@ pub enum Node {
         target: AstIndex,
         /// The expression to be assigned
         expression: AstIndex,
+        /// Whether or not the assignment uses `let`
+        let_assignment: bool,
     },
 
     /// A multiple-assignment expression
@@ -169,6 +214,8 @@ pub enum Node {
         targets: AstVec<AstIndex>,
         /// The expression to be assigned
         expression: AstIndex,
+        /// Whether or not the assignment uses `let`
+        let_assignment: bool,
     },
 
     /// A unary operation
@@ -197,19 +244,46 @@ pub enum Node {
         /// The expression that will be matched against
         expression: AstIndex,
         /// The series of arms that match against the provided expression
-        arms: Vec<MatchArm>,
+        arms: AstVec<AstIndex>,
+    },
+
+    /// An arm of a [Self::Match] expression
+    MatchArm {
+        /// A series of match patterns
+        ///
+        /// If `patterns` is empty then `else` is implied, and should always appear as the last arm.
+        patterns: AstVec<AstIndex>,
+        /// An optional condition for the match arm
+        ///
+        /// e.g.
+        /// match foo
+        ///   bar if check_condition bar then ...
+        condition: Option<AstIndex>,
+        /// The body of the match arm
+        expression: AstIndex,
     },
 
     /// A switch expression
-    Switch(AstVec<SwitchArm>),
+    Switch(AstVec<AstIndex>),
 
-    /// A `_` identifier
+    /// An arm of a [Self::Switch] expression
+    SwitchArm {
+        /// An optional condition for the switch arm
+        ///
+        /// None implies `else`, and should always appear as the last arm.
+        condition: Option<AstIndex>,
+        /// The body of the switch arm
+        expression: AstIndex,
+    },
+
+    /// A `_`-prefixed identifier
     ///
-    /// Used as a placeholder for unused function arguments or unpacked values, or as a wildcard
-    /// in match expressions.
+    /// Used as a placeholder for unused function arguments or unpacked values,
+    /// or as an ignored match-all in match expressions.
     ///
-    /// Comes with an optional name, e.g. `_foo` will have `foo` stored as a constant.
-    Wildcard(Option<ConstantIndex>, Option<AstIndex>),
+    /// Comes with an optional name (e.g. `_foo` will have `foo` stored as a constant),
+    /// and an optional type hint.
+    Ignored(Option<ConstantIndex>, Option<AstIndex>),
 
     /// Used when capturing variadic arguments, and when unpacking list or tuple arguments.
     ///
@@ -290,7 +364,9 @@ pub enum Node {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Function {
     /// The function's arguments
-    pub args: AstVec<AstIndex>,
+    ///
+    /// See [Node::FunctionArgs].
+    pub args: AstIndex,
     /// The number of locally assigned values
     ///
     /// Used by the compiler when reserving registers for local values at the start of the frame.
@@ -303,14 +379,10 @@ pub struct Function {
     pub accessed_non_locals: AstVec<ConstantIndex>,
     /// The function's body
     pub body: AstIndex,
-    /// A flag that indicates if the function arguments end with a variadic `...` argument
-    pub is_variadic: bool,
     /// A flag that indicates if the function is a generator or not
     ///
     /// The presence of a `yield` expression in the function body will set this to true.
     pub is_generator: bool,
-    /// The optional output type of the function
-    pub output_type: Option<AstIndex>,
 }
 
 /// A string definition
@@ -338,6 +410,8 @@ pub enum StringContents {
     ///
     /// An interpolated string is made up of a series of literals and template expressions,
     /// which are then joined together using a string builder.
+    // The interpolated nodes are stored in a `Vec` here rather than an `AstVec` to avoid bloating
+    // the overall size of `Node`.
     Interpolated(Vec<StringNode>),
 }
 
@@ -358,7 +432,7 @@ pub enum StringNode {
 /// A for loop definition
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AstFor {
-    /// The ids that capture each iteration's output values, or wildcards that ignore them
+    /// The ids that capture each iteration's output values
     pub args: AstVec<AstIndex>,
     /// The expression that produces an iterable value
     pub iterable: AstIndex,
@@ -377,6 +451,8 @@ pub struct AstIf {
     pub else_if_blocks: AstVec<(AstIndex, AstIndex)>,
     /// An optional `else` branch
     pub else_node: Option<AstIndex>,
+    /// Whether or not the if expression was defined using inline syntax
+    pub inline: bool,
 }
 
 /// An operation used in UnaryOp expressions
@@ -385,6 +461,22 @@ pub struct AstIf {
 pub enum AstUnaryOp {
     Negate,
     Not,
+}
+
+impl AstUnaryOp {
+    /// The binary op as a str
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AstUnaryOp::Negate => "-",
+            AstUnaryOp::Not => "not",
+        }
+    }
+}
+
+impl fmt::Display for AstUnaryOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// An operation used in BinaryOp expressions
@@ -396,11 +488,13 @@ pub enum AstBinaryOp {
     Multiply,
     Divide,
     Remainder,
+    Power,
     AddAssign,
     SubtractAssign,
     MultiplyAssign,
     DivideAssign,
     RemainderAssign,
+    PowerAssign,
     Equal,
     NotEqual,
     Less,
@@ -410,6 +504,41 @@ pub enum AstBinaryOp {
     And,
     Or,
     Pipe,
+}
+
+impl AstBinaryOp {
+    /// The binary op as a str
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AstBinaryOp::Add => "+",
+            AstBinaryOp::Subtract => "-",
+            AstBinaryOp::Multiply => "*",
+            AstBinaryOp::Divide => "/",
+            AstBinaryOp::Remainder => "%",
+            AstBinaryOp::Power => "^",
+            AstBinaryOp::AddAssign => "+=",
+            AstBinaryOp::SubtractAssign => "-=",
+            AstBinaryOp::MultiplyAssign => "*=",
+            AstBinaryOp::DivideAssign => "/=",
+            AstBinaryOp::RemainderAssign => "%=",
+            AstBinaryOp::PowerAssign => "^=",
+            AstBinaryOp::Equal => "==",
+            AstBinaryOp::NotEqual => "!=",
+            AstBinaryOp::Less => "<",
+            AstBinaryOp::LessOrEqual => "<=",
+            AstBinaryOp::Greater => ">",
+            AstBinaryOp::GreaterOrEqual => ">=",
+            AstBinaryOp::And => "and",
+            AstBinaryOp::Or => "or",
+            AstBinaryOp::Pipe => "->",
+        }
+    }
+}
+
+impl fmt::Display for AstBinaryOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// A try expression definition
@@ -426,7 +555,7 @@ pub struct AstTry {
 /// A catch block definition
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AstCatch {
-    /// The identifier that will receive a caught error, or a wildcard
+    /// The identifier that will receive a caught error
     pub arg: AstIndex,
     /// The catch block
     pub block: AstIndex,
@@ -474,48 +603,6 @@ pub enum ChainNode {
     NullCheck,
 }
 
-/// An arm in a match expression
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MatchArm {
-    /// A series of match patterns
-    ///
-    /// If `patterns` is empty then `else` is implied, and should always appear as the last arm.
-    pub patterns: AstVec<AstIndex>,
-    /// An optional condition for the match arm
-    ///
-    /// e.g.
-    /// match foo
-    ///   bar if check_condition bar then ...
-    pub condition: Option<AstIndex>,
-    /// The body of the match arm
-    pub expression: AstIndex,
-}
-
-impl MatchArm {
-    /// Returns true if the arm is `else`
-    pub fn is_else(&self) -> bool {
-        self.patterns.is_empty()
-    }
-}
-
-/// An arm in a switch expression
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SwitchArm {
-    /// An optional condition for the switch arm
-    ///
-    /// None implies `else`, and should always appear as the last arm.
-    pub condition: Option<AstIndex>,
-    /// The body of the switch arm
-    pub expression: AstIndex,
-}
-
-impl SwitchArm {
-    /// Returns true if the arm is `else`
-    pub fn is_else(&self) -> bool {
-        self.condition.is_none()
-    }
-}
-
 /// A meta key
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -530,6 +617,20 @@ pub enum MetaKeyId {
     Divide,
     /// @%
     Remainder,
+    /// @^
+    Power,
+    /// @r+
+    AddRhs,
+    /// @r-
+    SubtractRhs,
+    /// @r*
+    MultiplyRhs,
+    /// @r/
+    DivideRhs,
+    /// @r%
+    RemainderRhs,
+    /// @r^
+    PowerRhs,
     /// @+=
     AddAssign,
     /// @-=
@@ -540,6 +641,8 @@ pub enum MetaKeyId {
     DivideAssign,
     /// @%=
     RemainderAssign,
+    /// @^=
+    PowerAssign,
     /// @<
     Less,
     /// @<=
@@ -555,8 +658,13 @@ pub enum MetaKeyId {
 
     /// @index
     Index,
-    /// @index_mut
-    IndexMut,
+    /// @index_assign
+    IndexAssign,
+
+    /// @access
+    Access,
+    /// @access_assign
+    AccessAssign,
 
     /// @debug
     Debug,
@@ -599,6 +707,59 @@ pub enum MetaKeyId {
     Invalid,
 }
 
+impl MetaKeyId {
+    /// Returns the key id as a static str
+    pub fn as_str(&self) -> &'static str {
+        use MetaKeyId::*;
+        match self {
+            Add => "@+",
+            Subtract => "@-",
+            Multiply => "@*",
+            Divide => "@/",
+            Remainder => "@%",
+            Power => "@^",
+            AddRhs => "@r+",
+            SubtractRhs => "@r-",
+            MultiplyRhs => "@r*",
+            DivideRhs => "@r/",
+            RemainderRhs => "@r%",
+            PowerRhs => "@r^",
+            AddAssign => "@+=",
+            SubtractAssign => "@-=",
+            MultiplyAssign => "@*=",
+            DivideAssign => "@/=",
+            RemainderAssign => "@%=",
+            PowerAssign => "@^=",
+            Less => "@<",
+            LessOrEqual => "@<=",
+            Greater => "@>",
+            GreaterOrEqual => "@>=",
+            Equal => "@==",
+            NotEqual => "@!=",
+            Index => "@index",
+            IndexAssign => "@index_assign",
+            Access => "@access",
+            AccessAssign => "@access_assign",
+            Debug => "@debug",
+            Display => "@display",
+            Iterator => "@iterator",
+            Next => "@next",
+            NextBack => "@next_back",
+            Negate => "@negate",
+            Size => "@size",
+            Type => "@type",
+            Base => "@base",
+            Call => "@call",
+            Test => "@test",
+            PreTest => "@pre_test",
+            PostTest => "@post_test",
+            Main => "@main",
+            Named => "@meta",
+            Invalid => unreachable!(),
+        }
+    }
+}
+
 impl TryFrom<u8> for MetaKeyId {
     type Error = u8;
 
@@ -615,48 +776,7 @@ impl TryFrom<u8> for MetaKeyId {
 // Display impl used by koto-ls
 impl fmt::Display for MetaKeyId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use MetaKeyId::*;
-
-        write!(
-            f,
-            "@{}",
-            match self {
-                Add => "+",
-                Subtract => "-",
-                Multiply => "*",
-                Divide => "/",
-                Remainder => "%",
-                AddAssign => "+=",
-                SubtractAssign => "-=",
-                MultiplyAssign => "*=",
-                DivideAssign => "/=",
-                RemainderAssign => "%=",
-                Less => "<",
-                LessOrEqual => "<=",
-                Greater => ">",
-                GreaterOrEqual => ">=",
-                Equal => "==",
-                NotEqual => "!=",
-                Index => "index",
-                IndexMut => "index_mut",
-                Debug => "debug",
-                Display => "display",
-                Iterator => "iterator",
-                Next => "next",
-                NextBack => "next_back",
-                Negate => "negate",
-                Size => "size",
-                Type => "type",
-                Base => "base",
-                Call => "call",
-                Test => "test",
-                PreTest => "pre_test",
-                PostTest => "post_test",
-                Main => "main",
-                Named => "meta",
-                Invalid => unreachable!(),
-            }
-        )
+        f.write_str(self.as_str())
     }
 }
 

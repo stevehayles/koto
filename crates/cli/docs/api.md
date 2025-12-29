@@ -8,6 +8,10 @@ The Rust code examples are included from the
 
 # Rust API
 
+This document contains a collection of examples of how to interact with Koto from Rust code.
+
+The complete API documentation can be found [here][koto-docs].
+
 ## Hello World
 
 To run a Koto script, instantiate `koto::Koto` and call `compile_and_run`:
@@ -40,6 +44,15 @@ which can be accessed by calling `Koto::exports()`.
 exported_values.rs
 ```
 
+## Using Serde for Value Conversions
+
+Types that implement `serde::Deserialize` and `Serialize` can be converted
+to and from Koto values via `koto::serde::to_koto_value` and `from_koto_value`.
+
+```rust_include
+serde.rs
+```
+
 ## Adding Values to the Prelude
 
 The runtime's prelude is a `KMap`, which is Koto's standard hashmap type.
@@ -63,8 +76,8 @@ prelude_value_remove.rs
 
 ## Passing Arguments to Koto
 
-The arguments that are accessible in a script from `koto.args` can be set via
-`Koto::set_args`.
+The arguments that are accessible in a script from `os.args` can be set via
+`KotoSettings::with_args`.
 
 ```rust_include
 args.rs
@@ -102,7 +115,7 @@ module.rs
 ## Adding a Custom Object Type
 
 Any Rust type that implements `KotoObject` can be used in the Koto runtime.
-`KotoObject` requires `KotoType`, `KotoCopy`, and `KotoEntries` to be
+`KotoObject` requires `KotoType`, `KotoCopy`, and `KotoAccess` to be
 implemented.
 
 ```rust_include
@@ -134,7 +147,7 @@ Only one memory strategy can be enabled at a time, so default features need to b
 
 [dependencies.koto]
 version = "0.15"
-default-feautures = false
+default-features = false
 features = ["arc"]
 ```
 
@@ -150,4 +163,5 @@ using_koto_in_a_repl.rs
 
 ---
 
+[koto-docs]: https://docs.rs/koto/latest/koto/
 [type]: ./language_guide.md#type

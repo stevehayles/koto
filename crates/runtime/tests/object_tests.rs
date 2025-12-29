@@ -1,10 +1,13 @@
 mod objects {
-    use koto_derive::*;
-    use koto_runtime::{Result, prelude::*};
+    use std::ptr;
+
+    use indexmap::IndexMap;
+    use koto_memory::Address;
+    use koto_runtime::{Result, derive::*, prelude::*};
     use koto_test_utils::*;
 
     #[derive(Clone, Copy, Debug, KotoCopy, KotoType)]
-    #[koto(use_copy)]
+    #[koto(runtime = koto_runtime, use_copy)]
     struct TestObject {
         x: i64,
     }
@@ -50,13 +53,13 @@ mod objects {
     }
 
     macro_rules! arithmetic_op {
-        ($self:ident, $rhs:expr, $op:tt) => {
+        ($self:ident, $other:expr, $op:tt) => {
             {
                 use KValue::*;
-                match $rhs {
-                    Object(rhs) if rhs.is_a::<Self>() => {
-                        let rhs = rhs.cast::<Self>().unwrap();
-                        Ok(Self::make_value($self.x $op rhs.x))
+                match $other {
+                    Object(other) if other.is_a::<Self>() => {
+                        let other = other.cast::<Self>().unwrap();
+                        Ok(Self::make_value($self.x $op other.x))
                     }
                     Number(n) => {
                         Ok(Self::make_value($self.x $op i64::from(n)))
@@ -69,14 +72,29 @@ mod objects {
         }
     }
 
+    macro_rules! arithmetic_op_rhs {
+        ($self:ident, $other:expr, $op:tt) => {
+            {
+                match $other {
+                    KValue::Number(n) => {
+                        Ok(Self::make_value(i64::from(n) $op $self.x))
+                    }
+                    unexpected => {
+                        unexpected_type(&format!("a {} or Number", Self::type_static()), unexpected)
+                    }
+                }
+            }
+        }
+    }
+
     macro_rules! assignment_op {
-        ($self:ident, $rhs:expr, $op:tt) => {
+        ($self:ident, $other:expr, $op:tt) => {
             {
                 use KValue::*;
-                match $rhs {
-                    Object(rhs) if rhs.is_a::<Self>() => {
-                        let rhs = rhs.cast::<Self>().unwrap();
-                        $self.x $op rhs.x;
+                match $other {
+                    Object(other) if other.is_a::<Self>() => {
+                        let other = other.cast::<Self>().unwrap();
+                        $self.x $op other.x;
                         Ok(())
                     }
                     Number(n) => {
@@ -92,14 +110,14 @@ mod objects {
     }
 
     macro_rules! comparison_op {
-        ($self:ident, $rhs:expr, $op:tt) => {
+        ($self:ident, $other:expr, $op:tt) => {
             {
                 use KValue::*;
-                match $rhs {
-                    Object(rhs) if rhs.is_a::<Self>() => {
-                        let rhs = rhs.cast::<Self>().unwrap();
+                match $other {
+                    Object(other) if other.is_a::<Self>() => {
+                        let other = other.cast::<Self>().unwrap();
                         #[allow(clippy::float_cmp)]
-                        Ok($self.x $op rhs.x)
+                        Ok($self.x $op other.x)
                     }
                     Number(n) => {
                         #[allow(clippy::float_cmp)]
@@ -149,7 +167,7 @@ mod objects {
             }
         }
 
-        fn index_mut(&mut self, index: &KValue, value: &KValue) -> Result<()> {
+        fn index_assign(&mut self, index: &KValue, value: &KValue) -> Result<()> {
             match index {
                 KValue::Number(index) => {
                     assert_eq!(usize::from(index), 0);
@@ -177,72 +195,132 @@ mod objects {
             Ok(self.x.into())
         }
 
-        fn negate(&self, _vm: &mut KotoVm) -> Result<KValue> {
+        fn negate(&self) -> Result<KValue> {
             Ok(Self::make_value(-self.x))
         }
 
-        fn add(&self, rhs: &KValue) -> Result<KValue> {
-            arithmetic_op!(self, rhs, +)
+        fn add(&self, other: &KValue) -> Result<KValue> {
+            arithmetic_op!(self, other, +)
         }
 
-        fn subtract(&self, rhs: &KValue) -> Result<KValue> {
-            arithmetic_op!(self, rhs, -)
+        fn add_rhs(&self, other: &KValue) -> Result<KValue> {
+            arithmetic_op_rhs!(self, other, +)
         }
 
-        fn multiply(&self, rhs: &KValue) -> Result<KValue> {
-            arithmetic_op!(self, rhs, *)
+        fn subtract(&self, other: &KValue) -> Result<KValue> {
+            arithmetic_op!(self, other, -)
         }
 
-        fn divide(&self, rhs: &KValue) -> Result<KValue> {
-            arithmetic_op!(self, rhs, /)
+        fn subtract_rhs(&self, other: &KValue) -> Result<KValue> {
+            arithmetic_op_rhs!(self, other, -)
         }
 
-        fn remainder(&self, rhs: &KValue) -> Result<KValue> {
-            arithmetic_op!(self, rhs, %)
+        fn multiply(&self, other: &KValue) -> Result<KValue> {
+            arithmetic_op!(self, other, *)
         }
 
-        fn add_assign(&mut self, rhs: &KValue) -> Result<()> {
-            assignment_op!(self, rhs, +=)
+        fn multiply_rhs(&self, other: &KValue) -> Result<KValue> {
+            arithmetic_op_rhs!(self, other, *)
         }
 
-        fn subtract_assign(&mut self, rhs: &KValue) -> Result<()> {
-            assignment_op!(self, rhs, -=)
+        fn divide(&self, other: &KValue) -> Result<KValue> {
+            arithmetic_op!(self, other, /)
         }
 
-        fn multiply_assign(&mut self, rhs: &KValue) -> Result<()> {
-            assignment_op!(self, rhs, *=)
+        fn divide_rhs(&self, other: &KValue) -> Result<KValue> {
+            arithmetic_op_rhs!(self, other, /)
         }
 
-        fn divide_assign(&mut self, rhs: &KValue) -> Result<()> {
-            assignment_op!(self, rhs, /=)
+        fn remainder(&self, other: &KValue) -> Result<KValue> {
+            arithmetic_op!(self, other, %)
         }
 
-        fn remainder_assign(&mut self, rhs: &KValue) -> Result<()> {
-            assignment_op!(self, rhs, %=)
+        fn remainder_rhs(&self, other: &KValue) -> Result<KValue> {
+            arithmetic_op_rhs!(self, other, %)
         }
 
-        fn less(&self, rhs: &KValue) -> Result<bool> {
-            comparison_op!(self, rhs, <)
+        fn power(&self, other: &KValue) -> Result<KValue> {
+            match other {
+                KValue::Object(other) if other.is_a::<Self>() => {
+                    let other = other.cast::<Self>().unwrap();
+                    Ok(Self::make_value(self.x.pow(other.x as u32)))
+                }
+                KValue::Number(n) => Ok(Self::make_value(self.x.pow(u32::from(n)))),
+                unexpected => {
+                    unexpected_type(&format!("a {} or Number", Self::type_static()), unexpected)
+                }
+            }
         }
 
-        fn less_or_equal(&self, rhs: &KValue) -> Result<bool> {
-            comparison_op!(self, rhs, <=)
+        fn power_rhs(&self, other: &KValue) -> Result<KValue> {
+            match other {
+                KValue::Number(n) => Ok(Self::make_value(i64::from(n).pow(self.x as u32))),
+                unexpected => {
+                    unexpected_type(&format!("a {} or Number", Self::type_static()), unexpected)
+                }
+            }
         }
 
-        fn greater(&self, rhs: &KValue) -> Result<bool> {
-            comparison_op!(self, rhs, >)
+        fn add_assign(&mut self, other: &KValue) -> Result<()> {
+            assignment_op!(self, other, +=)
         }
 
-        fn greater_or_equal(&self, rhs: &KValue) -> Result<bool> {
-            comparison_op!(self, rhs, >=)
+        fn subtract_assign(&mut self, other: &KValue) -> Result<()> {
+            assignment_op!(self, other, -=)
         }
 
-        fn equal(&self, rhs: &KValue) -> Result<bool> {
-            comparison_op!(self, rhs, ==)
+        fn multiply_assign(&mut self, other: &KValue) -> Result<()> {
+            assignment_op!(self, other, *=)
         }
 
-        fn not_equal(&self, rhs: &KValue) -> Result<bool> {
-            comparison_op!(self, rhs, !=)
+        fn divide_assign(&mut self, other: &KValue) -> Result<()> {
+            assignment_op!(self, other, /=)
+        }
+
+        fn remainder_assign(&mut self, other: &KValue) -> Result<()> {
+            assignment_op!(self, other, %=)
+        }
+
+        fn power_assign(&mut self, other: &KValue) -> Result<()> {
+            use KValue::*;
+            match other {
+                Object(other) if other.is_a::<Self>() => {
+                    let other = other.cast::<Self>().unwrap();
+                    self.x = self.x.pow(other.x as u32);
+                    Ok(())
+                }
+                Number(n) => {
+                    self.x = self.x.pow(u32::from(n));
+                    Ok(())
+                }
+                unexpected => {
+                    unexpected_type(&format!("a {} or Number", Self::type_static()), unexpected)
+                }
+            }
+        }
+
+        fn less(&self, other: &KValue) -> Result<bool> {
+            comparison_op!(self, other, <)
+        }
+
+        fn less_or_equal(&self, other: &KValue) -> Result<bool> {
+            comparison_op!(self, other, <=)
+        }
+
+        fn greater(&self, other: &KValue) -> Result<bool> {
+            comparison_op!(self, other, >)
+        }
+
+        fn greater_or_equal(&self, other: &KValue) -> Result<bool> {
+            comparison_op!(self, other, >=)
+        }
+
+        fn equal(&self, other: &KValue) -> Result<bool> {
+            comparison_op!(self, other, ==)
+        }
+
+        fn not_equal(&self, other: &KValue) -> Result<bool> {
+            comparison_op!(self, other, !=)
         }
 
         fn is_iterable(&self) -> IsIterable {
@@ -255,6 +333,193 @@ mod objects {
     }
 
     #[derive(Clone, Debug, KotoCopy, KotoType)]
+    #[koto(runtime = koto_runtime)]
+    struct TestObjectAccess {
+        field: KValue,
+        field_for_override: KValue,
+        field_for_fallback: KValue,
+        number: i64,
+    }
+
+    impl TestObjectAccess {
+        fn make_value() -> KValue {
+            KObject::from(Self {
+                field: KValue::Null,
+                field_for_override: KValue::Null,
+                field_for_fallback: KValue::Null,
+                number: 0,
+            })
+            .into()
+        }
+    }
+
+    #[koto_impl(runtime = koto_runtime)]
+    impl TestObjectAccess {
+        #[koto_get]
+        fn field(&self) -> KValue {
+            self.field.clone()
+        }
+
+        #[koto_set]
+        fn set_field(&mut self, data: &KValue) {
+            self.field = data.clone();
+        }
+
+        // For testing naming and aliases.
+        #[koto_get(name = "field_1", alias = "field_2", alias = "field_3")]
+        fn field_x(&self) -> KValue {
+            self.field.clone()
+        }
+
+        #[koto_set(name = "field_1", alias = "field_2", alias = "field_3")]
+        fn set_field_x(&mut self, data: &KValue) {
+            self.field = data.clone();
+        }
+
+        #[koto_method]
+        fn method(&self) -> KValue {
+            "method".into()
+        }
+
+        // For testing overloading
+        #[koto_method(name = "identify")]
+        fn identify_number(&mut self, _: f64) -> &str {
+            "that's a number"
+        }
+
+        #[koto_method(name = "identify")]
+        fn identify_numbers(&mut self, _: f64, _: f64) -> &str {
+            "that's two numbers"
+        }
+
+        #[koto_method(name = "identify")]
+        fn identify_string(&mut self, _: &str) -> &str {
+            "that's a string"
+        }
+
+        // For testing builder methods
+        #[koto_method]
+        fn add(&mut self, arg: i64) -> &mut Self {
+            self.number += arg;
+            self
+        }
+
+        #[koto_get]
+        fn number(&self) -> i64 {
+            self.number
+        }
+
+        #[koto_get_override]
+        fn get_override(&self, key: &KString) -> Option<KValue> {
+            if key.as_str() == "field_for_override" {
+                return Some(self.field_for_override.clone());
+            }
+
+            None
+        }
+
+        #[koto_get_fallback]
+        fn get_fallback(&self, key: &KString) -> Option<KValue> {
+            if key.as_str() != "field_for_fallback" {
+                return None;
+            }
+
+            Some(self.field_for_fallback.clone())
+        }
+
+        #[koto_set_override]
+        fn set_override(&mut self, key: &KString, value: &KValue) -> bool {
+            if key.as_str() == "field_for_override" {
+                self.field_for_override = value.clone();
+                return true;
+            }
+
+            false
+        }
+
+        #[koto_set_fallback]
+        fn set_fallback(&mut self, key: &KString, value: &KValue) -> Result<()> {
+            if key.as_str() != "field_for_fallback" {
+                return runtime_error!("unexpected key '{key}'");
+            }
+
+            self.field_for_fallback = value.clone();
+            Ok(())
+        }
+    }
+
+    impl KotoObject for TestObjectAccess {}
+
+    /// An object that behaves similar to a `KMap`.
+    #[derive(Clone, Debug, KotoCopy, KotoType)]
+    #[koto(runtime = koto_runtime)]
+    struct MapLikeObject {
+        map: IndexMap<KString, KValue>,
+    }
+
+    impl MapLikeObject {
+        fn make_value() -> KValue {
+            KObject::from(Self {
+                map: IndexMap::new(),
+            })
+            .into()
+        }
+    }
+
+    #[koto_impl(runtime = koto_runtime)]
+    impl MapLikeObject {
+        #[koto_method]
+        fn length(&self) -> usize {
+            self.map.len()
+        }
+
+        #[koto_get_override]
+        fn access_override(&self, key: &KString) -> Result<Option<KValue>> {
+            Ok(self.map.get(key).cloned())
+        }
+
+        // This object has no other `access_assign` entries, so it doesn't
+        // matter whether we use `_override` or `_fallback` here.
+        #[koto_set_fallback]
+        fn access_assign_fallback(&mut self, key: &KString, value: &KValue) -> Result<()> {
+            self.map.insert(key.clone(), value.clone());
+            Ok(())
+        }
+    }
+
+    impl KotoObject for MapLikeObject {
+        fn display(&self, ctx: &mut DisplayContext) -> Result<()> {
+            if ctx.debug_enabled() {
+                ctx.append('{');
+            }
+
+            ctx.append(self.type_string());
+            ctx.append(": {");
+            ctx.push_container(Address::from(ptr::from_ref(self)));
+
+            for (i, (key, value)) in self.map.iter().enumerate() {
+                if i > 0 {
+                    ctx.append(", ");
+                }
+
+                ctx.append(key);
+                ctx.append(": ");
+                value.display(ctx)?;
+            }
+
+            ctx.append('}');
+            ctx.pop_container();
+
+            if ctx.debug_enabled() {
+                ctx.append('}');
+            }
+
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug, KotoCopy, KotoType)]
+    #[koto(runtime = koto_runtime)]
     struct TestIterator {
         x: i64,
     }
@@ -265,7 +530,7 @@ mod objects {
         }
     }
 
-    impl KotoEntries for TestIterator {}
+    impl KotoAccess for TestIterator {}
 
     impl KotoObject for TestIterator {
         fn is_iterable(&self) -> IsIterable {
@@ -284,6 +549,7 @@ mod objects {
     }
 
     #[derive(Clone, KotoCopy, KotoType)]
+    #[koto(runtime = koto_runtime)]
     struct GenericObject<T>
     where
         T: KotoField,
@@ -306,6 +572,17 @@ mod objects {
         fn get(&self) -> KValue {
             self.value.clone().into()
         }
+
+        #[koto_get]
+        fn value(&self) -> KValue {
+            self.value.clone().into()
+        }
+
+        #[koto_set]
+        fn set_value(&mut self, value: &KValue) {
+            _ = value;
+            // not implemented, just checking that it compiles
+        }
     }
 
     impl<T> KotoObject for GenericObject<T>
@@ -319,20 +596,41 @@ mod objects {
         let vm = KotoVm::default();
         let prelude = vm.prelude();
 
-        prelude.add_fn("make_object", |ctx| match ctx.args() {
-            [KValue::Number(x)] => Ok(TestObject::make_value(x.into())),
-            unexpected => unexpected_args("|Number|", unexpected),
-        });
-
-        prelude.add_fn("make_generic", |ctx| match ctx.args() {
-            [KValue::Bool(x)] => Ok(GenericObject::<bool>::make_value(*x)),
-            [KValue::Number(x)] => Ok(GenericObject::<KNumber>::make_value(*x)),
-            [KValue::Str(x)] => Ok(GenericObject::<KString>::make_value(x.clone())),
-            unexpected => unexpected_args("|Number| or |String|", unexpected),
-        });
+        prelude.add_fn("make_object", make_object);
+        prelude.add_fn("make_object_access", make_object_access);
+        prelude.add_fn("make_map_like", make_map_like);
+        prelude.add_fn("make_generic", make_generic);
 
         if let Err(e) = check_script_output_with_vm(vm, script, expected_output.into()) {
             panic!("{e}");
+        }
+    }
+
+    koto_fn! {
+        runtime = koto_runtime;
+
+        fn make_object(x: i64) -> KValue {
+            TestObject::make_value(x)
+        }
+
+        fn make_object_access() -> KValue {
+            TestObjectAccess::make_value()
+        }
+
+        fn make_map_like() -> KValue {
+            MapLikeObject::make_value()
+        }
+
+        fn make_generic(x: bool) -> KValue {
+             GenericObject::<bool>::make_value(x)
+        }
+
+        fn make_generic(x: KNumber) -> KValue {
+             GenericObject::<KNumber>::make_value(x)
+        }
+
+        fn make_generic(x: &KString) -> KValue {
+             GenericObject::<KString>::make_value(x.clone())
         }
     }
 
@@ -443,6 +741,15 @@ else
 ";
             test_object_script(script, "@@@");
         }
+
+        #[test]
+        fn access() {
+            let script = "
+x = make_generic 99
+x.value
+";
+            test_object_script(script, 99);
+        }
     }
 
     mod unary_op {
@@ -503,8 +810,9 @@ make_object(10)
         #[test]
         fn add() {
             let script = "
-x = (make_object 11) + (make_object 22) + 33
-x.as_number()
+x = (make_object 11) + (make_object 22)
+y = 33 + x
+y.as_number()
 ";
             test_object_script(script, 66);
         }
@@ -512,8 +820,9 @@ x.as_number()
         #[test]
         fn subtract() {
             let script = "
-x = (make_object 99) - (make_object 90) - 9
-x.as_number()
+x = (make_object 99) - (make_object 90) - 1
+y = 8 - x
+y.as_number()
 ";
             test_object_script(script, 0);
         }
@@ -522,27 +831,40 @@ x.as_number()
         fn multiply() {
             let script = "
 x = (make_object 3) * (make_object 11)
-x.as_number()
+y = 10 * x
+y.as_number()
 ";
-            test_object_script(script, 33);
+            test_object_script(script, 330);
         }
 
         #[test]
         fn divide() {
             let script = "
 x = (make_object 90) / (make_object 10)
-x.as_number()
+y = 9 / x
+y.as_number()
 ";
-            test_object_script(script, 9);
+            test_object_script(script, 1);
         }
 
         #[test]
         fn remainder() {
             let script = "
 x = (make_object 45) % (make_object 10)
-x.as_number()
+y = 12 % x
+y.as_number()
 ";
-            test_object_script(script, 5);
+            test_object_script(script, 2);
+        }
+
+        #[test]
+        fn power() {
+            let script = "
+x = (make_object 2) ^ (make_object 3)
+y = 2 ^ x
+y.as_number()
+";
+            test_object_script(script, 256);
         }
 
         #[test]
@@ -644,10 +966,31 @@ x.as_number()
         fn remainder_assign_to_self() {
             let script = "
 x = make_object 11
-x /= x
+x %= x
 x.as_number()
 ";
-            test_object_script(script, 1);
+            test_object_script(script, 0);
+        }
+
+        #[test]
+        fn power_assign() {
+            let script = "
+x = make_object 2
+x ^= make_object 3
+x ^= 2
+x.as_number()
+";
+            test_object_script(script, 64);
+        }
+
+        #[test]
+        fn power_assign_to_self() {
+            let script = "
+x = make_object 3
+x ^= x
+x.as_number()
+";
+            test_object_script(script, 27);
         }
 
         #[test]
@@ -782,7 +1125,7 @@ match make_object 10
         }
 
         #[test]
-        fn index_mut_assign() {
+        fn index_assign() {
             let script = "
 x = make_object 100
 x[0] = 23
@@ -791,7 +1134,7 @@ x[0] = 23
         }
 
         #[test]
-        fn index_mut_compound_assign() {
+        fn index_compound_assign() {
             let script = "
 x = make_object 100
 x[0] += 1
@@ -810,14 +1153,112 @@ x()
     }
 
     #[test]
-    fn insert_via_dot_access() {
-        let script = "
-x = make_object 41
-x.foo = 122
-x.foo += 1
-x.foo
-";
-        test_object_script(script, 123);
+    fn object_access() {
+        let script = r##"
+x = make_object_access()
+
+assert_eq x.method(), "method"
+
+x.field = "foo"
+x.field_for_override = "bar"
+x.field_for_fallback = "baz"
+
+assert_eq x.field, "foo"
+assert_eq x.field_for_override, "bar"
+assert_eq x.field_for_fallback, "baz"
+
+# testing aliases
+
+should_throw = |expected_error, f|
+  result = try 
+    f()
+    { @type: "Ok" }
+  catch error
+    { @type: "Err", msg: error }
+  match type result
+    "Ok" then throw "function should have panicked!"
+    "Err" then 
+      if result.msg != expected_error
+        throw "expected error '{expected_error}' but got '{error}'"
+
+# make sure the function identifier does not become an access key
+# if an explicit `name` argument was given
+should_throw "'field_x' not found in 'TestObjectAccess'", || x.field_x
+should_throw "unexpected key 'field_x'", || x.field_x = "something"
+
+assert_eq x.field_1, "foo"
+assert_eq x.field_2, "foo"
+assert_eq x.field_3, "foo"
+
+x.field_1 = "foo_1"
+assert_eq x.field, "foo_1"
+
+x.field_2 = "foo_2"
+assert_eq x.field, "foo_2"
+
+x.field_3 = "foo_3"
+assert_eq x.field, "foo_3"
+"##;
+        test_object_script(script, ());
+    }
+
+    #[test]
+    fn method_overloading() {
+        let script = r##"
+x = make_object_access()
+
+assert_eq x.identify(3.141), "that's a number"
+assert_eq x.identify(3.141, 6.283), "that's two numbers"
+assert_eq x.identify("pi"), "that's a string"
+
+try 
+  x.identify([])
+  throw "the expression above should have thrown"
+catch error
+  assert_eq error, "Unexpected arguments.
+  Expected: |Number|, |Number, Number|, or |String|
+  Provided: |List|"
+"##;
+        test_object_script(script, ());
+    }
+
+    #[test]
+    fn builder_method() {
+        let script = r##"
+x = make_object_access()
+x.add(1).add(2).add(3)
+x.number
+"##;
+        test_object_script(script, 6);
+    }
+
+    #[test]
+    fn map_like_object() {
+        let script = r##"
+x = make_map_like()
+assert_eq x.length(), 0
+
+try
+  print x.foo
+  throw "expression above should have errored"
+catch error
+  assert_eq error, "'foo' not found in 'MapLikeObject'"
+
+x.foo = 1
+assert_eq x.foo, 1
+assert_eq x.length(), 1
+assert_eq '{x}', r'MapLikeObject: {foo: 1}'
+
+x.bar = 2
+x.baz = 3
+assert_eq x.length(), 3
+assert_eq '{x}', r'MapLikeObject: {foo: 1, bar: 2, baz: 3}'
+
+x.length = "oops"
+assert_eq x.length, "oops"
+assert_eq '{x}', r"MapLikeObject: {foo: 1, bar: 2, baz: 3, length: 'oops'}"
+"##;
+        test_object_script(script, ());
     }
 
     mod temporaries {

@@ -1,9 +1,10 @@
 use crate::{
-    DefaultStderr, DefaultStdin, DefaultStdout, KFunction, Ptr, Result,
-    core_lib::CoreLib,
+    InstructionFrame, KFunction, Ptr, Result, UnavailableStderr, UnavailableStdin,
+    UnavailableStdout,
+    core_lib::{CoreLib, io::File, koto::Unimplemented},
     error::{Error, ErrorKind},
     prelude::*,
-    types::{meta_id_to_key, value::RegisterSlice},
+    types::{FunctionContext, meta_id_to_key, value::RegisterSlice},
 };
 use instant::Instant;
 use koto_bytecode::{Chunk, Instruction, InstructionReader, ModuleLoader};
@@ -39,7 +40,7 @@ struct VmContext {
     // The module loader used to compile imported modules
     loader: KCell<ModuleLoader>,
     // The cached export maps of imported modules
-    imported_modules: KCell<ModuleCache>,
+    module_cache: KCell<ModuleCache>,
 }
 
 impl Default for VmContext {
@@ -52,12 +53,36 @@ impl VmContext {
     fn with_settings(settings: KotoVmSettings) -> Self {
         let core_lib = CoreLib::default();
 
+        core_lib.os.insert(
+            "args",
+            KValue::Tuple(
+                settings
+                    .args
+                    .iter()
+                    .map(|s| KValue::from(s.as_str()))
+                    .collect::<Vec<_>>()
+                    .into(),
+            ),
+        );
+
+        core_lib
+            .io
+            .insert("stdin", File::new(settings.stdin.clone()));
+
+        core_lib
+            .io
+            .insert("stdout", File::new(settings.stdout.clone()));
+
+        core_lib
+            .io
+            .insert("stderr", File::new(settings.stderr.clone()));
+
         Self {
             settings,
             prelude: core_lib.prelude(),
             core_lib,
             loader: ModuleLoader::default().into(),
-            imported_modules: ModuleCache::default().into(),
+            module_cache: ModuleCache::default().into(),
         }
     }
 }
@@ -95,20 +120,25 @@ pub struct KotoVmSettings {
     /// reload the script when one of its dependencies has changed.
     pub module_imported_callback: Option<Box<dyn ModuleImportedCallback>>,
 
-    /// The runtime's `stdin`
+    /// The runtime's `stdin`that can be accessed from within the script via `io.stdin`
     ///
-    /// Default: [`DefaultStdin`]
+    /// Default: [`UnavailableStdin`]
     pub stdin: Ptr<dyn KotoFile>,
 
-    /// The runtime's `stdout`
+    /// The runtime's `stdout`that can be accessed from within the script via `io.stdout`
     ///
-    /// Default: [`DefaultStdout`]
+    /// Default: [`UnavailableStdout`]
     pub stdout: Ptr<dyn KotoFile>,
 
-    /// The runtime's `stderr`
+    /// The runtime's `stderr` that can be accessed from within the script via `io.stderr`
     ///
-    /// Default: [`DefaultStderr`]
+    /// Default: [`UnavailableStderr`]
     pub stderr: Ptr<dyn KotoFile>,
+
+    /// The runtime's `args` that can be accessed from within the script via `os.args`
+    ///
+    /// Default: `vec![]`
+    pub args: Vec<String>,
 }
 
 impl Default for KotoVmSettings {
@@ -117,9 +147,10 @@ impl Default for KotoVmSettings {
             run_import_tests: true,
             execution_limit: None,
             module_imported_callback: None,
-            stdin: make_ptr!(DefaultStdin::default()),
-            stdout: make_ptr!(DefaultStdout::default()),
-            stderr: make_ptr!(DefaultStderr::default()),
+            stdin: make_ptr!(UnavailableStdin::default()),
+            stdout: make_ptr!(UnavailableStdout::default()),
+            stderr: make_ptr!(UnavailableStderr::default()),
+            args: vec![],
         }
     }
 }
@@ -252,7 +283,17 @@ impl KotoVm {
         // Set up an execution frame to run the chunk in
         let frame_base = self.next_register();
         self.registers.push(KValue::Null); // Instance register
-        self.push_frame(chunk, 0, frame_base, None);
+        self.push_frame(
+            chunk,
+            0,
+            frame_base,
+            None,
+            // Provide access to the module's exports
+            Some(NonLocals {
+                module_exports: self.exports.clone(),
+                wildcard_imports: None,
+            }),
+        );
 
         // Ensure that execution stops here if an error is thrown
         self.frame_mut().execution_barrier = true;
@@ -312,61 +353,45 @@ impl KotoVm {
         args: CallArgs,
     ) -> Result<KValue> {
         if !function.is_callable() {
-            return runtime_error!("run_function: the provided value isn't a function");
+            return unexpected_type("Function", &function);
         }
 
         let result_register = self.next_register();
-        let frame_base = result_register + 1;
-
         self.registers.push(KValue::Null); // Result register
+
+        let args = match (&args, &function) {
+            (CallArgs::AsTuple(args), KValue::Function(f)) if f.flags.arg_is_unpacked_tuple() => {
+                // If the function is being called with a tuple, and the function has a single
+                // unpacked tuple as its argument, then the call args can be passed into the function
+                // as a temporary tuple. The temp tuple's contents get pushed onto the stack here in
+                // the registers preceding the function's frame.
+                let start = self.registers.len();
+                self.registers.extend(args.iter().cloned());
+                CallArgs::Single(KValue::TemporaryTuple(RegisterSlice {
+                    start,
+                    count: args.len(),
+                }))
+            }
+            _ => args,
+        };
+
+        let frame_base = self.next_register();
         self.registers.push(instance.unwrap_or_default()); // Frame base
 
-        let (arg_count, temp_tuple_values) = match args {
+        let arg_count = match args {
             CallArgs::Single(arg) => {
                 self.registers.push(arg);
-                (1, None)
+                1
             }
             CallArgs::Separate(args) => {
                 self.registers.extend_from_slice(args);
-                (args.len() as u8, None)
+                args.len() as u8
             }
             CallArgs::AsTuple(args) => {
-                // If the function has a single arg which is an unpacked tuple,
-                // then the tuple contents can go into a temporary tuple.
-                //
-                // The temp tuple goes into the first arg register, the function's captures
-                // follow, and then the temp tuple contents can be placed in the registers
-                // following the captures. The captures and temp tuple contents are added
-                // to the value stack in call_function/call_generator, here we only need to
-                // add the temp tuple itself.
-                //
-                // At runtime the unpacking instructions will still be executed, resulting
-                // in the tuple values being unpacked into the same registers that they're
-                // already in. This is redundant work, but more efficient than allocating a
-                // non-temporary Tuple for the values.
-                match &function {
-                    KValue::Function(f) if f.flags.arg_is_unpacked_tuple() => {
-                        let capture_count = f
-                            .captures
-                            .as_ref()
-                            .map(|captures| captures.len())
-                            .unwrap_or(0) as u8;
-                        let temp_tuple = KValue::TemporaryTuple(RegisterSlice {
-                            // The unpacked tuple contents go into the registers after the
-                            // function's captures, which are placed after the temp tuple and
-                            // instance registers.
-                            start: 2 + capture_count,
-                            count: args.len() as u8,
-                        });
-                        self.registers.push(temp_tuple);
-                        (1, Some(args))
-                    }
-                    _ => {
-                        let tuple_contents = Vec::from(args);
-                        self.registers.push(KValue::Tuple(tuple_contents.into()));
-                        (1, None)
-                    }
-                }
+                // If the call arg tuple wasn't converted into a temp tuple above,
+                // then at this point it needs to be stored in a KTuple.
+                self.registers.push(KValue::Tuple(Vec::from(args).into()));
+                1
             }
         };
 
@@ -382,7 +407,6 @@ impl KotoVm {
                 packed_arg_count: 0,
             },
             function,
-            temp_tuple_values,
         )?;
 
         let result = if self.call_stack.len() == old_frame_count {
@@ -417,6 +441,7 @@ impl KotoVm {
         use UnaryOp::*;
 
         let old_frame_count = self.call_stack.len();
+
         let result_register = self.next_register();
         let value_register = result_register + 1;
 
@@ -435,7 +460,7 @@ impl KotoVm {
                     if !op.is_callable() {
                         return unexpected_type("Callable function from @next_back", &op);
                     }
-                    self.call_overridden_unary_op(Some(result_register), value_register, op)?
+                    self.call_overridden_op_1(Some(result_register), value_register, op)?
                 }
                 unexpected => {
                     return unexpected_type(
@@ -447,28 +472,13 @@ impl KotoVm {
             Size => self.run_size(result_register, value_register, true)?,
         }
 
-        let result = if self.call_stack.len() == old_frame_count {
-            // If the call stack is the same size, then a native function was called and the result
-            // will be in the result register
-            Ok(self.clone_register(result_register))
-        } else {
-            // If the call stack size has changed, then an overridden operator in Koto has been
-            // called, so continue execution until the call is complete.
-            self.frame_mut().execution_barrier = true;
-            let result = self.execute_instructions();
-            if result.is_err() {
-                self.pop_frame(KValue::Null)?;
-            }
-            result
-        };
-
-        self.truncate_registers(result_register);
-        result
+        self.get_overridden_op_result(old_frame_count, result_register)
     }
 
     /// Provides the result of running a binary operation on a pair of Values
     pub fn run_binary_op(&mut self, op: BinaryOp, lhs: KValue, rhs: KValue) -> Result<KValue> {
         let old_frame_count = self.call_stack.len();
+
         let result_register = self.next_register();
         let lhs_register = result_register + 1;
         let rhs_register = result_register + 2;
@@ -478,12 +488,23 @@ impl KotoVm {
         self.registers.push(rhs);
 
         match op {
-            BinaryOp::Add => self.run_add(result_register, lhs_register, rhs_register)?,
-            BinaryOp::Subtract => self.run_subtract(result_register, lhs_register, rhs_register)?,
-            BinaryOp::Multiply => self.run_multiply(result_register, lhs_register, rhs_register)?,
-            BinaryOp::Divide => self.run_divide(result_register, lhs_register, rhs_register)?,
-            BinaryOp::Remainder => {
+            BinaryOp::Add | BinaryOp::AddRhs => {
+                self.run_add(result_register, lhs_register, rhs_register)?
+            }
+            BinaryOp::Subtract | BinaryOp::SubtractRhs => {
+                self.run_subtract(result_register, lhs_register, rhs_register)?
+            }
+            BinaryOp::Multiply | BinaryOp::MultiplyRhs => {
+                self.run_multiply(result_register, lhs_register, rhs_register)?
+            }
+            BinaryOp::Divide | BinaryOp::DivideRhs => {
+                self.run_divide(result_register, lhs_register, rhs_register)?
+            }
+            BinaryOp::Remainder | BinaryOp::RemainderRhs => {
                 self.run_remainder(result_register, lhs_register, rhs_register)?
+            }
+            BinaryOp::Power | BinaryOp::PowerRhs => {
+                self.run_power(result_register, lhs_register, rhs_register)?
             }
             BinaryOp::AddAssign => {
                 self.run_add_assign(lhs_register, rhs_register)?;
@@ -505,6 +526,10 @@ impl KotoVm {
                 self.run_remainder_assign(lhs_register, rhs_register)?;
                 self.set_register(result_register, self.clone_register(lhs_register));
             }
+            BinaryOp::PowerAssign => {
+                self.run_power_assign(lhs_register, rhs_register)?;
+                self.set_register(result_register, self.clone_register(lhs_register));
+            }
             BinaryOp::Less => self.run_less(result_register, lhs_register, rhs_register)?,
             BinaryOp::LessOrEqual => {
                 self.run_less_or_equal(result_register, lhs_register, rhs_register)?
@@ -517,9 +542,85 @@ impl KotoVm {
             BinaryOp::NotEqual => {
                 self.run_not_equal(result_register, lhs_register, rhs_register)?
             }
-            BinaryOp::Index => self.run_index(result_register, lhs_register, rhs_register)?,
         }
 
+        self.get_overridden_op_result(old_frame_count, result_register)
+    }
+
+    /// Provides the result of running a read operation (i.e. access or index) on a pair of values
+    pub fn run_read_op(
+        &mut self,
+        op: ReadOp,
+        container: KValue,
+        read_arg: KValue,
+    ) -> Result<KValue> {
+        let old_frame_count = self.call_stack.len();
+
+        let result_register = self.next_register();
+        let container_register = result_register + 1;
+        let read_arg_register = result_register + 2;
+
+        self.registers.push(KValue::Null); // Result register
+        self.registers.push(container);
+        self.registers.push(read_arg);
+
+        match op {
+            ReadOp::Index => {
+                self.run_index(result_register, container_register, read_arg_register)?
+            }
+            ReadOp::Access => {
+                let key_string = match self.clone_register(read_arg_register) {
+                    KValue::Str(s) => s,
+                    other => return unexpected_type("a String", &other),
+                };
+                self.run_access(result_register, container_register, key_string)?;
+            }
+        }
+
+        self.get_overridden_op_result(old_frame_count, result_register)
+    }
+
+    /// Provides the result of running a write operation (i.e. via access or index)
+    pub fn run_write_op(
+        &mut self,
+        op: WriteOp,
+        container: KValue,
+        write_arg: KValue,
+        write_value: KValue,
+    ) -> Result<KValue> {
+        let old_frame_count = self.call_stack.len();
+
+        let result_register = self.next_register();
+        let container_register = result_register + 1;
+        let write_arg_register = result_register + 2;
+        let write_value_register = result_register + 3;
+
+        self.registers.push(KValue::Null); // Result register
+        self.registers.push(container);
+        self.registers.push(write_arg);
+        self.registers.push(write_value);
+
+        match op {
+            WriteOp::IndexAssign => {
+                self.run_index_assign(container_register, container_register, write_arg_register)?
+            }
+            WriteOp::AccessAssign => {
+                self.run_access_assign(
+                    container_register,
+                    write_arg_register,
+                    write_value_register,
+                )?;
+            }
+        }
+
+        self.get_overridden_op_result(old_frame_count, result_register)
+    }
+
+    fn get_overridden_op_result(
+        &mut self,
+        old_frame_count: usize,
+        result_register: u8,
+    ) -> Result<KValue> {
         let result = if self.call_stack.len() == old_frame_count {
             // If the call stack is the same size, then a native function was called and the result
             // will be in the result register
@@ -559,24 +660,19 @@ impl KotoVm {
             Tuple(t) => Ok(KIterator::with_tuple(t)),
             Str(s) => Ok(KIterator::with_string(s)),
             Map(m) => Ok(KIterator::with_map(m)),
-            Object(o) => {
+            Object(ref o) => {
                 use IsIterable::*;
 
                 let o_inner = o.try_borrow()?;
                 match o_inner.is_iterable() {
-                    NotIterable => runtime_error!("{} is not iterable", o_inner.type_string()),
+                    NotIterable => unexpected_type("Iterable", &value),
                     Iterable => o_inner.make_iterator(self),
                     ForwardIterator | BidirectionalIterator => {
                         KIterator::with_object(self.spawn_shared_vm(), o.clone())
                     }
                 }
             }
-            unexpected => {
-                runtime_error!(
-                    "expected iterable value, found '{}'",
-                    unexpected.type_as_string(),
-                )
-            }
+            unexpected => unexpected_type("Iterable", &unexpected),
         }
     }
 
@@ -620,34 +716,34 @@ impl KotoVm {
             }
 
             let make_test_error = |error: Error, message: &str| {
-                Err(error.with_prefix(&format!("{message} '{test_name}'")))
+                Err(error.with_context(format!("{message} '{test_name}'")))
             };
 
-            if let Some(pre_test) = &pre_test {
-                if pre_test.is_callable() {
-                    let pre_test_result =
-                        self.call_instance_function(self_arg.clone(), pre_test.clone(), &[]);
+            if let Some(pre_test) = &pre_test
+                && pre_test.is_callable()
+            {
+                let pre_test_result =
+                    self.call_instance_function(self_arg.clone(), pre_test.clone(), &[]);
 
-                    if let Err(error) = pre_test_result {
-                        return make_test_error(error, "Error while preparing to run test");
-                    }
+                if let Err(error) = pre_test_result {
+                    return make_test_error(error, "while preparing to run test");
                 }
             }
 
             let test_result = self.call_instance_function(self_arg.clone(), test, &[]);
 
             if let Err(error) = test_result {
-                return make_test_error(error, "Error while running test");
+                return make_test_error(error, "while running test");
             }
 
-            if let Some(post_test) = &post_test {
-                if post_test.is_callable() {
-                    let post_test_result =
-                        self.call_instance_function(self_arg.clone(), post_test.clone(), &[]);
+            if let Some(post_test) = &post_test
+                && post_test.is_callable()
+            {
+                let post_test_result =
+                    self.call_instance_function(self_arg.clone(), post_test.clone(), &[]);
 
-                    if let Err(error) = post_test_result {
-                        return make_test_error(error, "Error after running test");
-                    }
+                if let Err(error) = post_test_result {
+                    return make_test_error(error, "after running test");
                 }
             }
         }
@@ -669,16 +765,16 @@ impl KotoVm {
         self.execution_state = ExecutionState::Active;
 
         while let Some(instruction) = self.reader.next() {
-            if let Some(timeout) = timeout.as_mut() {
-                if timeout.check_for_timeout() {
-                    self.execution_state = ExecutionState::Inactive;
-                    return self
-                        .pop_call_stack_on_error(
-                            ErrorKind::Timeout(timeout.execution_limit).into(),
-                            false,
-                        )
-                        .map(|_| KValue::Null);
-                }
+            if let Some(timeout) = timeout.as_mut()
+                && timeout.check_for_timeout()
+            {
+                self.execution_state = ExecutionState::Inactive;
+                return self
+                    .pop_call_stack_on_error(
+                        ErrorKind::Timeout(timeout.execution_limit).into(),
+                        false,
+                    )
+                    .map(|_| KValue::Null);
             }
 
             match self.execute_instruction(instruction) {
@@ -701,7 +797,13 @@ impl KotoVm {
                         self.set_register(recover_register, catch_value);
                         self.set_ip(ip);
                     }
-                    Err(error) => {
+                    Err(mut error) => {
+                        // The error hasn't been caught, so is being propagated outside of this.
+                        // Koto errors need a VM to allow the error value to be displayed,
+                        // so spawn one now.
+                        if let ErrorKind::KotoError { vm, .. } = &mut error.error {
+                            *vm = Some(self.spawn_shared_vm().into());
+                        }
                         self.execution_state = ExecutionState::Inactive;
                         return Err(error);
                     }
@@ -745,15 +847,20 @@ impl KotoVm {
                 self.set_register(register, string.into());
             }
             LoadNonLocal { register, constant } => self.run_load_non_local(register, constant)?,
-            ValueExport { name, value } => self.run_value_export(name, value)?,
-            Import { register } => self.run_import(register)?,
+            ExportValue { key, value } => self.run_export_value(key, value)?,
+            ExportEntry { entry } => self.run_export_entry(entry)?,
+            Import { register } => self.run_import(register, false)?,
+            ImportAll { register } => self.run_import(register, true)?,
             MakeTempTuple {
                 register,
                 start,
                 count,
             } => self.set_register(
                 register,
-                KValue::TemporaryTuple(RegisterSlice { start, count }),
+                KValue::TemporaryTuple(RegisterSlice {
+                    start: self.register_index(start),
+                    count: count as usize,
+                }),
             ),
             TempTupleToTuple { register, source } => {
                 self.run_temp_tuple_to_tuple(register, source)?
@@ -802,7 +909,7 @@ impl KotoVm {
             MakeIterator { register, iterable } => {
                 self.run_make_iterator(register, iterable, true)?
             }
-            Function { .. } => self.run_make_function(instruction),
+            Function { .. } => self.run_make_function(instruction)?,
             Capture {
                 function,
                 target,
@@ -815,11 +922,13 @@ impl KotoVm {
             Multiply { register, lhs, rhs } => self.run_multiply(register, lhs, rhs)?,
             Divide { register, lhs, rhs } => self.run_divide(register, lhs, rhs)?,
             Remainder { register, lhs, rhs } => self.run_remainder(register, lhs, rhs)?,
+            Power { register, lhs, rhs } => self.run_power(register, lhs, rhs)?,
             AddAssign { lhs, rhs } => self.run_add_assign(lhs, rhs)?,
             SubtractAssign { lhs, rhs } => self.run_subtract_assign(lhs, rhs)?,
             MultiplyAssign { lhs, rhs } => self.run_multiply_assign(lhs, rhs)?,
             DivideAssign { lhs, rhs } => self.run_divide_assign(lhs, rhs)?,
             RemainderAssign { lhs, rhs } => self.run_remainder_assign(lhs, rhs)?,
+            PowerAssign { lhs, rhs } => self.run_power_assign(lhs, rhs)?,
             Less { register, lhs, rhs } => self.run_less(register, lhs, rhs)?,
             LessOrEqual { register, lhs, rhs } => self.run_less_or_equal(register, lhs, rhs)?,
             Greater { register, lhs, rhs } => self.run_greater(register, lhs, rhs)?,
@@ -848,7 +957,6 @@ impl KotoVm {
                     packed_arg_count: unpacked_arg_count,
                 },
                 self.clone_register(function),
-                None,
             )?,
             CallInstance {
                 result,
@@ -866,7 +974,6 @@ impl KotoVm {
                     packed_arg_count: unpacked_arg_count,
                 },
                 self.clone_register(function),
-                None,
             )?,
             Return { register } => {
                 if let Some(return_value) = self.pop_frame(self.clone_register(register))? {
@@ -876,23 +983,7 @@ impl KotoVm {
             }
             Yield { register } => control_flow = ControlFlow::Yield(self.clone_register(register)),
             Throw { register } => {
-                let thrown_value = self.clone_register(register);
-
-                match &thrown_value {
-                    KValue::Str(_) | KValue::Object(_) => {}
-                    KValue::Map(m) if m.contains_meta_key(&UnaryOp::Display.into()) => {}
-                    other => {
-                        return unexpected_type(
-                            "a String or a value that implements @display",
-                            other,
-                        );
-                    }
-                };
-
-                return Err(crate::Error::from_koto_value(
-                    thrown_value,
-                    self.spawn_shared_vm(),
-                ));
+                return Err(crate::Error::from_koto_value(self.clone_register(register)));
             }
             Size { register, value } => self.run_size(register, value, false)?,
             IterNext {
@@ -925,12 +1016,12 @@ impl KotoVm {
                 register,
                 index,
                 value,
-            } => self.run_index_mut(register, index, value)?,
-            MapInsert {
+            } => self.run_index_assign(register, index, value)?,
+            AccessAssign {
                 register,
                 key,
                 value,
-            } => self.run_map_insert(register, key, value)?,
+            } => self.run_access_assign(register, key, value)?,
             MetaInsert {
                 register,
                 value,
@@ -949,6 +1040,17 @@ impl KotoVm {
                 value,
                 key,
             } => self.run_access(register, value, self.koto_string_from_constant(key))?,
+            TryAccess {
+                register,
+                value,
+                key,
+                jump_offset,
+            } => self.run_try_access(
+                register,
+                value,
+                self.koto_string_from_constant(key),
+                jump_offset as u32,
+            )?,
             AccessString {
                 register,
                 value,
@@ -959,6 +1061,18 @@ impl KotoVm {
                     other => return unexpected_type("a String", &other),
                 };
                 self.run_access(register, value, key_string)?;
+            }
+            TryAccessString {
+                register,
+                value,
+                key,
+                jump_offset,
+            } => {
+                let key_string = match self.clone_register(key) {
+                    KValue::Str(s) => s,
+                    other => return unexpected_type("a String", &other),
+                };
+                self.run_try_access(register, value, key_string, jump_offset as u32)?;
             }
             TryStart {
                 arg_register,
@@ -993,8 +1107,8 @@ impl KotoVm {
         let name = self.get_constant_str(constant_index);
 
         let non_local = self
-            .exports
-            .get(name)
+            .frame()
+            .non_local(name)
             .or_else(|| self.context.prelude.get(name));
 
         if let Some(non_local) = non_local {
@@ -1005,18 +1119,44 @@ impl KotoVm {
         }
     }
 
-    fn run_value_export(&mut self, name_register: u8, value_register: u8) -> Result<()> {
-        let name = ValueKey::try_from(self.clone_register(name_register))?;
+    fn run_export_value(&mut self, key_register: u8, value_register: u8) -> Result<()> {
+        let key = ValueKey::try_from(self.clone_register(key_register))?;
         let value = self.clone_register(value_register);
-        self.exports.data_mut().insert(name, value);
+        self.exports.data_mut().insert(key, value);
+        Ok(())
+    }
+
+    fn run_export_entry(&mut self, entry_register: u8) -> Result<()> {
+        let maybe_entry = self.clone_register(entry_register);
+        let maybe_key_value_pair = match &maybe_entry {
+            KValue::Tuple(tuple) => match tuple.data() {
+                [key, value] => Some((key.clone(), value.clone())),
+                _ => None,
+            },
+            KValue::TemporaryTuple(temp_tuple) => {
+                match self.register_slice_raw(temp_tuple.start, temp_tuple.count) {
+                    [key, value] => Some((key.clone(), value.clone())),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some((key, value)) = maybe_key_value_pair else {
+            dbg!(&self.registers);
+            return unexpected_type("Key/Value pair to export", &maybe_entry);
+        };
+        self.exports
+            .data_mut()
+            .insert(ValueKey::try_from(key)?, value);
         Ok(())
     }
 
     fn run_temp_tuple_to_tuple(&mut self, register: u8, source_register: u8) -> Result<()> {
         match self.clone_register(source_register) {
             KValue::TemporaryTuple(temp_registers) => {
-                let tuple =
-                    KTuple::from(self.register_slice(temp_registers.start, temp_registers.count));
+                let tuple = KTuple::from(
+                    self.register_slice_raw(temp_registers.start, temp_registers.count),
+                );
                 self.set_register(register, KValue::Tuple(tuple));
             }
             _ => unreachable!(),
@@ -1080,11 +1220,7 @@ impl KotoVm {
                     unreachable!()
                 };
                 if op.is_callable() || op.is_generator() {
-                    return self.call_overridden_unary_op(
-                        Some(result_register),
-                        iterable_register,
-                        op,
-                    );
+                    return self.call_overridden_op_1(Some(result_register), iterable_register, op);
                 } else {
                     return unexpected_type("callable function from @iterator", &op);
                 }
@@ -1157,7 +1293,7 @@ impl KotoVm {
                 TemporaryTuple(RegisterSlice { start, count }) => {
                     if count > 0 {
                         (
-                            Some(self.clone_register(start)),
+                            Some(self.registers[start].clone()),
                             TemporaryTuple(RegisterSlice {
                                 start: start + 1,
                                 count: count - 1,
@@ -1183,10 +1319,21 @@ impl KotoVm {
                         Some(KIteratorOutput::ValuePair(first, second)) => {
                             if let Some(result) = result_register {
                                 if output_is_temporary {
-                                    self.set_register(result + 1, first);
-                                    self.set_register(result + 2, second);
+                                    // Place the value pair in a temporary tuple following the
+                                    // result register. The assumption here is that the values
+                                    // following the result register are available for re-use,
+                                    // if that turns out to not be true in all cases then a
+                                    // different approach will be needed.
+                                    let start = result + 1;
+                                    let first_index = self.register_index(start);
+                                    let second_index = first_index + 1;
+                                    if second_index >= self.registers.len() {
+                                        self.registers.resize(second_index + 1, KValue::Null);
+                                    }
+                                    self.registers[first_index] = first;
+                                    self.registers[second_index] = second;
                                     Some(TemporaryTuple(RegisterSlice {
-                                        start: result + 1,
+                                        start: first_index,
                                         count: 2,
                                     }))
                                 } else {
@@ -1210,7 +1357,7 @@ impl KotoVm {
                         return unexpected_type("Callable function from @next", &op);
                     }
                     // The return value will be retrieved from execute_instructions
-                    self.call_overridden_unary_op(None, iterable_register, op)?;
+                    self.call_overridden_op_1(None, iterable_register, op)?;
                     self.frame_mut().execution_barrier = true;
                     match self.execute_instructions() {
                         Ok(Null) => None,
@@ -1248,9 +1395,10 @@ impl KotoVm {
     fn run_temp_index(&mut self, result: u8, value: u8, index: i8) -> Result<()> {
         use KValue::*;
 
-        let index_op = BinaryOp::Index.into();
+        let index_op = ReadOp::Index.into();
+        let lhs = self.get_register(value);
 
-        let result_value = match self.get_register(value) {
+        let result_value = match lhs {
             List(list) => {
                 let index = signed_index_to_unsigned(index, list.data().len());
                 list.data().get(index).cloned().unwrap_or(Null)
@@ -1261,9 +1409,9 @@ impl KotoVm {
             }
             TemporaryTuple(RegisterSlice { start, count }) => {
                 let count = *count;
-                if index.unsigned_abs() < count {
-                    let index = signed_index_to_unsigned(index, count as usize);
-                    self.clone_register(start + index as u8)
+                if (index.unsigned_abs() as usize) < count {
+                    let index = signed_index_to_unsigned(index, count);
+                    self.registers[start + index].clone()
                 } else {
                     Null
                 }
@@ -1272,9 +1420,49 @@ impl KotoVm {
                 let index = signed_index_to_unsigned(index, s.len());
                 s.with_bounds(index..index + 1).into()
             }
+            Range(r) => {
+                let result: KNumber = if index < 0 {
+                    let Some((end, inclusive)) = r.end() else {
+                        return runtime_error!(
+                            "Unable to index a {} with {}",
+                            lhs.type_as_string(),
+                            index
+                        );
+                    };
+
+                    if r.is_ascending() {
+                        let end = if inclusive { end + 1 } else { end };
+                        end + index as i64
+                    } else {
+                        let end = if inclusive { end - 1 } else { end };
+                        end - index as i64
+                    }
+                } else {
+                    let Some(start) = r.start() else {
+                        return runtime_error!(
+                            "Unable to index a {} with {}",
+                            lhs.type_as_string(),
+                            index
+                        );
+                    };
+                    if r.is_ascending() {
+                        start + index as i64
+                    } else {
+                        start - index as i64
+                    }
+                }
+                .into();
+
+                if r.contains(result) {
+                    result.into()
+                } else {
+                    Null
+                }
+            }
             Map(map) if map.contains_meta_key(&index_op) => {
                 let op = map.get_meta_value(&index_op).unwrap();
-                return self.call_overridden_binary_op(Some(result), value, index.into(), op);
+                let lhs = lhs.clone();
+                return self.call_overridden_op_2(Some(result), lhs, index.into(), op);
             }
             Map(map) => {
                 let data = map.data();
@@ -1304,7 +1492,7 @@ impl KotoVm {
     fn run_slice(&mut self, register: u8, value: u8, index: i8, is_slice_to: bool) -> Result<()> {
         use KValue::*;
 
-        let index_op = BinaryOp::Index.into();
+        let index_op = ReadOp::Index.into();
 
         let result = match self.clone_register(value) {
             List(list) => {
@@ -1343,7 +1531,7 @@ impl KotoVm {
                 } else {
                     index..size as i64
                 };
-                self.run_binary_op(BinaryOp::Index, Map(m), KRange::from(range).into())?
+                self.run_read_op(ReadOp::Index, Map(m), KRange::from(range).into())?
             }
             Map(m) => {
                 let data = m.data();
@@ -1378,7 +1566,7 @@ impl KotoVm {
         Ok(())
     }
 
-    fn run_make_function(&mut self, function_instruction: Instruction) {
+    fn run_make_function(&mut self, function_instruction: Instruction) -> Result<()> {
         match function_instruction {
             Instruction::Function {
                 register,
@@ -1398,17 +1586,37 @@ impl KotoVm {
                     None
                 };
 
+                let non_locals = if flags.non_local_access() {
+                    let non_locals = self.frame().non_locals.clone();
+                    if non_locals.is_none() {
+                        return runtime_error!(ErrorKind::UnexpectedError);
+                    }
+                    non_locals
+                } else {
+                    None
+                };
+
+                let context = if captures.is_some() || non_locals.is_some() {
+                    Some(Ptr::from(FunctionContext {
+                        captures,
+                        non_locals,
+                    }))
+                } else {
+                    None
+                };
+
                 let function = KFunction::new(
                     self.chunk(),
                     self.ip(),
                     arg_count,
                     optional_arg_count,
                     flags,
-                    captures,
+                    context,
                 );
 
                 self.jump_ip(size as u32);
                 self.set_register(register, KValue::Function(function));
+                Ok(())
             }
             _ => unreachable!(),
         }
@@ -1425,7 +1633,7 @@ impl KotoVm {
 
         match function {
             KValue::Function(f) => {
-                if let Some(captures) = &f.captures {
+                if let Some(captures) = f.captures() {
                     captures.data_mut()[capture_index as usize] = self.clone_register(value);
                 }
                 Ok(())
@@ -1442,9 +1650,9 @@ impl KotoVm {
             Number(n) => Number(-n),
             Map(m) if m.contains_meta_key(&Negate.into()) => {
                 let op = m.get_meta_value(&Negate.into()).unwrap();
-                return self.call_overridden_unary_op(Some(result), value, op);
+                return self.call_overridden_op_1(Some(result), value, op);
             }
-            Object(o) => o.try_borrow()?.negate(self)?,
+            Object(o) => o.try_borrow()?.negate()?,
             unexpected => return unexpected_type("negatable value", &unexpected),
         };
         self.set_register(result, result_value);
@@ -1471,7 +1679,7 @@ impl KotoVm {
         match self.clone_register(value) {
             KValue::Map(m) if m.contains_meta_key(&Debug.into()) => {
                 let op = m.get_meta_value(&Debug.into()).unwrap();
-                self.call_overridden_unary_op(Some(result), value, op)
+                self.call_overridden_op_1(Some(result), value, op)
             }
             other => {
                 let mut display_context = DisplayContext::with_vm(self).enable_debug();
@@ -1492,7 +1700,7 @@ impl KotoVm {
         match self.clone_register(value) {
             KValue::Map(m) if m.contains_meta_key(&Display.into()) => {
                 let op = m.get_meta_value(&Display.into()).unwrap();
-                self.call_overridden_unary_op(Some(result), value, op)
+                self.call_overridden_op_1(Some(result), value, op)
             }
             other => {
                 let mut display_context = DisplayContext::with_vm(self);
@@ -1508,11 +1716,13 @@ impl KotoVm {
     }
 
     fn run_add(&mut self, result: u8, lhs: u8, rhs: u8) -> Result<()> {
-        use BinaryOp::Add;
+        use BinaryOp::{Add, AddRhs};
         use KValue::*;
+        use macros::*;
 
         let lhs_value = self.get_register(lhs);
         let rhs_value = self.get_register(rhs);
+
         let result_value = match (lhs_value, rhs_value) {
             (Number(a), Number(b)) => Number(a + b),
             (Str(a), Str(b)) => {
@@ -1528,10 +1738,17 @@ impl KotoVm {
                 Tuple(result.into())
             }
             (Map(m), _) if m.contains_meta_key(&Add.into()) => {
-                let op = m.get_meta_value(&Add.into()).unwrap();
+                let lhs_value = lhs_value.clone();
                 let rhs_value = rhs_value.clone();
-                return self.call_overridden_binary_op(Some(result), lhs, rhs_value, op);
+                call_metamap_arithmetic_op!(self, Add, add, m, lhs_value, rhs_value, result)
             }
+            (Object(o), _) => {
+                call_object_arithmetic_op!(self, Add, add, o, lhs_value, rhs_value, result)
+            }
+            (_, Map(m)) if m.contains_meta_key(&AddRhs.into()) => {
+                call_metamap_binary_op_rhs!(self, AddRhs, m, lhs_value, rhs_value, result);
+            }
+            (_, Object(o)) => call_object_binary_op!(AddRhs, add_rhs, o, lhs_value, rhs_value),
             (Map(a), Map(b)) => {
                 let mut data = a.data().clone();
                 data.extend(b.data().iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -1547,7 +1764,6 @@ impl KotoVm {
                 };
                 Map(KMap::with_contents(data, meta))
             }
-            (Object(o), _) => o.try_borrow()?.add(rhs_value)?,
             _ => return binary_op_error(lhs_value, rhs_value, Add),
         };
 
@@ -1556,72 +1772,45 @@ impl KotoVm {
     }
 
     fn run_subtract(&mut self, result: u8, lhs: u8, rhs: u8) -> Result<()> {
-        use BinaryOp::Subtract;
-        use KValue::*;
-
-        let lhs_value = self.get_register(lhs);
-        let rhs_value = self.get_register(rhs);
-        let result_value = match (lhs_value, rhs_value) {
-            (Number(a), Number(b)) => Number(a - b),
-            (Map(m), _) if m.contains_meta_key(&Subtract.into()) => {
-                let op = m.get_meta_value(&Subtract.into()).unwrap();
-                let rhs_value = rhs_value.clone();
-                return self.call_overridden_binary_op(Some(result), lhs, rhs_value, op);
-            }
-            (Object(o), _) => o.try_borrow()?.subtract(rhs_value)?,
-            _ => return binary_op_error(lhs_value, rhs_value, Subtract),
-        };
-
-        self.set_register(result, result_value);
-        Ok(())
+        macros::run_arithmetic_op!(
+            self,
+            Subtract,
+            subtract,
+            |a: &KNumber, b: &KNumber| a - b,
+            result,
+            lhs,
+            rhs
+        )
     }
 
     fn run_multiply(&mut self, result: u8, lhs: u8, rhs: u8) -> Result<()> {
-        use BinaryOp::Multiply;
-        use KValue::*;
-
-        let lhs_value = self.get_register(lhs);
-        let rhs_value = self.get_register(rhs);
-
-        let result_value = match (lhs_value, rhs_value) {
-            (Number(a), Number(b)) => Number(a * b),
-            (Map(m), _) if m.contains_meta_key(&Multiply.into()) => {
-                let op = m.get_meta_value(&Multiply.into()).unwrap();
-                let rhs_value = rhs_value.clone();
-                return self.call_overridden_binary_op(Some(result), lhs, rhs_value, op);
-            }
-            (Object(o), _) => o.try_borrow()?.multiply(rhs_value)?,
-            _ => return binary_op_error(lhs_value, rhs_value, Multiply),
-        };
-
-        self.set_register(result, result_value);
-        Ok(())
+        macros::run_arithmetic_op!(
+            self,
+            Multiply,
+            multiply,
+            |a: &KNumber, b: &KNumber| a * b,
+            result,
+            lhs,
+            rhs
+        )
     }
 
     fn run_divide(&mut self, result: u8, lhs: u8, rhs: u8) -> Result<()> {
-        use BinaryOp::Divide;
-        use KValue::*;
-
-        let lhs_value = self.get_register(lhs);
-        let rhs_value = self.get_register(rhs);
-        let result_value = match (lhs_value, rhs_value) {
-            (Number(a), Number(b)) => Number(a / b),
-            (Map(m), _) if m.contains_meta_key(&Divide.into()) => {
-                let op = m.get_meta_value(&Divide.into()).unwrap();
-                let rhs_value = rhs_value.clone();
-                return self.call_overridden_binary_op(Some(result), lhs, rhs_value, op);
-            }
-            (Object(o), _) => o.try_borrow()?.divide(rhs_value)?,
-            _ => return binary_op_error(lhs_value, rhs_value, Divide),
-        };
-
-        self.set_register(result, result_value);
-        Ok(())
+        macros::run_arithmetic_op!(
+            self,
+            Divide,
+            divide,
+            |a: &KNumber, b: &KNumber| a / b,
+            result,
+            lhs,
+            rhs
+        )
     }
 
     fn run_remainder(&mut self, result: u8, lhs: u8, rhs: u8) -> Result<()> {
-        use BinaryOp::Remainder;
+        use BinaryOp::{Remainder, RemainderRhs};
         use KValue::*;
+        use macros::*;
 
         let lhs_value = self.get_register(lhs);
         let rhs_value = self.get_register(rhs);
@@ -1633,11 +1822,23 @@ impl KotoVm {
             }
             (Number(a), Number(b)) => Number(a % b),
             (Map(m), _) if m.contains_meta_key(&Remainder.into()) => {
-                let op = m.get_meta_value(&Remainder.into()).unwrap();
+                let lhs_value = lhs_value.clone();
                 let rhs_value = rhs_value.clone();
-                return self.call_overridden_binary_op(Some(result), lhs, rhs_value, op);
+                call_metamap_arithmetic_op!(
+                    self, Remainder, remainder, m, lhs_value, rhs_value, result
+                )
             }
-            (Object(o), _) => o.try_borrow()?.remainder(rhs_value)?,
+            (Object(o), _) => {
+                call_object_arithmetic_op!(
+                    self, Remainder, remainder, o, lhs_value, rhs_value, result
+                )
+            }
+            (_, Map(m)) if m.contains_meta_key(&RemainderRhs.into()) => {
+                call_metamap_binary_op_rhs!(self, RemainderRhs, m, lhs_value, rhs_value, result);
+            }
+            (_, Object(o)) => {
+                call_object_binary_op!(RemainderRhs, remainder_rhs, o, lhs_value, rhs_value)
+            }
             _ => return binary_op_error(lhs_value, rhs_value, Remainder),
         };
         self.set_register(result, result_value);
@@ -1645,134 +1846,82 @@ impl KotoVm {
         Ok(())
     }
 
-    fn run_add_assign(&mut self, lhs: u8, rhs: u8) -> Result<()> {
-        use BinaryOp::AddAssign;
-        use KValue::*;
+    fn run_power(&mut self, result: u8, lhs: u8, rhs: u8) -> Result<()> {
+        macros::run_arithmetic_op!(
+            self,
+            Power,
+            power,
+            |a: &KNumber, b: &KNumber| a.pow(*b),
+            result,
+            lhs,
+            rhs
+        )
+    }
 
-        let lhs_value = self.get_register(lhs);
-        let rhs_value = self.get_register(rhs);
-        match (lhs_value, rhs_value) {
-            (Number(a), Number(b)) => {
-                self.set_register(lhs, Number(a + b));
-                Ok(())
-            }
-            (Map(m), _) if m.contains_meta_key(&AddAssign.into()) => {
-                let op = m.get_meta_value(&AddAssign.into()).unwrap();
-                let rhs_value = rhs_value.clone();
-                // The call result can be discarded, the result is always the modified LHS
-                self.call_overridden_binary_op(None, lhs, rhs_value, op)
-            }
-            (Object(o), Object(o2)) if o2.is_same_instance(o2) => {
-                let o2 = Object(o2.try_borrow()?.copy());
-                o.try_borrow_mut()?.add_assign(&o2)
-            }
-            (Object(o), _) => o.try_borrow_mut()?.add_assign(rhs_value),
-            _ => binary_op_error(lhs_value, rhs_value, AddAssign),
-        }
+    fn run_add_assign(&mut self, lhs: u8, rhs: u8) -> Result<()> {
+        macros::run_compound_assign_op!(
+            self,
+            AddAssign,
+            add_assign,
+            |a: &KNumber, b: &KNumber| a + b,
+            lhs,
+            rhs
+        )
     }
 
     fn run_subtract_assign(&mut self, lhs: u8, rhs: u8) -> Result<()> {
-        use BinaryOp::SubtractAssign;
-        use KValue::*;
-
-        let lhs_value = self.get_register(lhs);
-        let rhs_value = self.get_register(rhs);
-        match (lhs_value, rhs_value) {
-            (Number(a), Number(b)) => {
-                self.set_register(lhs, Number(a - b));
-                Ok(())
-            }
-            (Map(m), _) if m.contains_meta_key(&SubtractAssign.into()) => {
-                let op = m.get_meta_value(&SubtractAssign.into()).unwrap();
-                let rhs_value = rhs_value.clone();
-                // The call result can be discarded, the result is always the modified LHS
-                self.call_overridden_binary_op(None, lhs, rhs_value, op)
-            }
-            (Object(o), Object(o2)) if o2.is_same_instance(o2) => {
-                let o2 = Object(o2.try_borrow()?.copy());
-                o.try_borrow_mut()?.subtract_assign(&o2)
-            }
-            (Object(o), _) => o.try_borrow_mut()?.subtract_assign(rhs_value),
-            _ => binary_op_error(lhs_value, rhs_value, SubtractAssign),
-        }
+        macros::run_compound_assign_op!(
+            self,
+            SubtractAssign,
+            subtract_assign,
+            |a: &KNumber, b: &KNumber| a - b,
+            lhs,
+            rhs
+        )
     }
 
     fn run_multiply_assign(&mut self, lhs: u8, rhs: u8) -> Result<()> {
-        use BinaryOp::MultiplyAssign;
-        use KValue::*;
-
-        let lhs_value = self.get_register(lhs);
-        let rhs_value = self.get_register(rhs);
-        match (lhs_value, rhs_value) {
-            (Number(a), Number(b)) => {
-                self.set_register(lhs, Number(a * b));
-                Ok(())
-            }
-            (Map(m), _) if m.contains_meta_key(&MultiplyAssign.into()) => {
-                let op = m.get_meta_value(&MultiplyAssign.into()).unwrap();
-                let rhs_value = rhs_value.clone();
-                // The call result can be discarded, the result is always the modified LHS
-                self.call_overridden_binary_op(None, lhs, rhs_value, op)
-            }
-            (Object(o), Object(o2)) if o2.is_same_instance(o2) => {
-                let o2 = Object(o2.try_borrow()?.copy());
-                o.try_borrow_mut()?.multiply_assign(&o2)
-            }
-            (Object(o), _) => o.try_borrow_mut()?.multiply_assign(rhs_value),
-            _ => binary_op_error(lhs_value, rhs_value, MultiplyAssign),
-        }
+        macros::run_compound_assign_op!(
+            self,
+            MultiplyAssign,
+            multiply_assign,
+            |a: &KNumber, b: &KNumber| a * b,
+            lhs,
+            rhs
+        )
     }
 
     fn run_divide_assign(&mut self, lhs: u8, rhs: u8) -> Result<()> {
-        use BinaryOp::DivideAssign;
-        use KValue::*;
-
-        let lhs_value = self.get_register(lhs);
-        let rhs_value = self.get_register(rhs);
-        match (lhs_value, rhs_value) {
-            (Number(a), Number(b)) => {
-                self.set_register(lhs, Number(a / b));
-                Ok(())
-            }
-            (Map(m), _) if m.contains_meta_key(&DivideAssign.into()) => {
-                let op = m.get_meta_value(&DivideAssign.into()).unwrap();
-                let rhs_value = rhs_value.clone();
-                // The call result can be discarded, the result is always the modified LHS
-                self.call_overridden_binary_op(None, lhs, rhs_value, op)
-            }
-            (Object(o), Object(o2)) if o2.is_same_instance(o2) => {
-                let o2 = Object(o2.try_borrow()?.copy());
-                o.try_borrow_mut()?.divide_assign(&o2)
-            }
-            (Object(o), _) => o.try_borrow_mut()?.divide_assign(rhs_value),
-            _ => binary_op_error(lhs_value, rhs_value, DivideAssign),
-        }
+        macros::run_compound_assign_op!(
+            self,
+            DivideAssign,
+            divide_assign,
+            |a: &KNumber, b: &KNumber| a / b,
+            lhs,
+            rhs
+        )
     }
 
     fn run_remainder_assign(&mut self, lhs: u8, rhs: u8) -> Result<()> {
-        use BinaryOp::RemainderAssign;
-        use KValue::*;
+        macros::run_compound_assign_op!(
+            self,
+            RemainderAssign,
+            remainder_assign,
+            |a: &KNumber, b: &KNumber| a % b,
+            lhs,
+            rhs
+        )
+    }
 
-        let lhs_value = self.get_register(lhs);
-        let rhs_value = self.get_register(rhs);
-        match (lhs_value, rhs_value) {
-            (Number(a), Number(b)) => {
-                self.set_register(lhs, Number(a % b));
-                Ok(())
-            }
-            (Map(m), _) if m.contains_meta_key(&RemainderAssign.into()) => {
-                let op = m.get_meta_value(&RemainderAssign.into()).unwrap();
-                let rhs_value = rhs_value.clone();
-                // The call result can be discarded, the result is always the modified LHS
-                self.call_overridden_binary_op(None, lhs, rhs_value, op)
-            }
-            (Object(o), Object(o2)) if o2.is_same_instance(o2) => {
-                let o2 = Object(o2.try_borrow()?.copy());
-                o.try_borrow_mut()?.remainder_assign(&o2)
-            }
-            (Object(o), _) => o.try_borrow_mut()?.remainder_assign(rhs_value),
-            _ => binary_op_error(lhs_value, rhs_value, RemainderAssign),
-        }
+    fn run_power_assign(&mut self, lhs: u8, rhs: u8) -> Result<()> {
+        macros::run_compound_assign_op!(
+            self,
+            PowerAssign,
+            power_assign,
+            |a: &KNumber, b: &KNumber| a.pow(*b),
+            lhs,
+            rhs
+        )
     }
 
     fn run_less(&mut self, result: u8, lhs: u8, rhs: u8) -> Result<()> {
@@ -1785,9 +1934,7 @@ impl KotoVm {
             (Number(a), Number(b)) => Bool(a < b),
             (Str(a), Str(b)) => Bool(a.as_str() < b.as_str()),
             (Map(m), _) if m.contains_meta_key(&Less.into()) => {
-                let op = m.get_meta_value(&Less.into()).unwrap();
-                let rhs_value = rhs_value.clone();
-                return self.call_overridden_binary_op(Some(result), lhs, rhs_value, op);
+                macros::call_metamap_binary_op!(self, Less, m, lhs_value, rhs_value, result);
             }
             (Object(o), _) => o.try_borrow()?.less(rhs_value)?.into(),
             _ => return binary_op_error(lhs_value, rhs_value, Less),
@@ -1798,7 +1945,7 @@ impl KotoVm {
     }
 
     fn run_less_or_equal(&mut self, result: u8, lhs: u8, rhs: u8) -> Result<()> {
-        use BinaryOp::LessOrEqual;
+        use BinaryOp::{Equal, Less, LessOrEqual};
         use KValue::*;
 
         let lhs_value = self.get_register(lhs);
@@ -1807,9 +1954,23 @@ impl KotoVm {
             (Number(a), Number(b)) => Bool(a <= b),
             (Str(a), Str(b)) => Bool(a.as_str() <= b.as_str()),
             (Map(m), _) if m.contains_meta_key(&LessOrEqual.into()) => {
-                let op = m.get_meta_value(&LessOrEqual.into()).unwrap();
+                macros::call_metamap_binary_op!(self, LessOrEqual, m, lhs_value, rhs_value, result);
+            }
+            (Map(m), _)
+                if m.contains_meta_key(&Less.into()) && m.contains_meta_key(&Equal.into()) =>
+            {
+                let lhs_value = lhs_value.clone();
                 let rhs_value = rhs_value.clone();
-                return self.call_overridden_binary_op(Some(result), lhs, rhs_value, op);
+                let less_op = m.get_meta_value(&Less.into()).unwrap();
+                let equal_op = m.get_meta_value(&Equal.into()).unwrap();
+                let less = self.run_overridden_comparison_op(
+                    lhs_value.clone(),
+                    rhs_value.clone(),
+                    less_op,
+                )?;
+                let result =
+                    less || self.run_overridden_comparison_op(lhs_value, rhs_value, equal_op)?;
+                result.into()
             }
             (Object(o), _) => o.try_borrow()?.less_or_equal(rhs_value)?.into(),
             _ => return binary_op_error(lhs_value, rhs_value, LessOrEqual),
@@ -1820,7 +1981,7 @@ impl KotoVm {
     }
 
     fn run_greater(&mut self, result: u8, lhs: u8, rhs: u8) -> Result<()> {
-        use BinaryOp::Greater;
+        use BinaryOp::{Equal, Greater, Less};
         use KValue::*;
 
         let lhs_value = self.get_register(lhs);
@@ -1829,9 +1990,23 @@ impl KotoVm {
             (Number(a), Number(b)) => Bool(a > b),
             (Str(a), Str(b)) => Bool(a.as_str() > b.as_str()),
             (Map(m), _) if m.contains_meta_key(&Greater.into()) => {
-                let op = m.get_meta_value(&Greater.into()).unwrap();
+                macros::call_metamap_binary_op!(self, Greater, m, lhs_value, rhs_value, result);
+            }
+            (Map(m), _)
+                if m.contains_meta_key(&Less.into()) && m.contains_meta_key(&Equal.into()) =>
+            {
+                let lhs_value = lhs_value.clone();
                 let rhs_value = rhs_value.clone();
-                return self.call_overridden_binary_op(Some(result), lhs, rhs_value, op);
+                let less_op = m.get_meta_value(&Less.into()).unwrap();
+                let equal_op = m.get_meta_value(&Equal.into()).unwrap();
+                let less = self.run_overridden_comparison_op(
+                    lhs_value.clone(),
+                    rhs_value.clone(),
+                    less_op,
+                )?;
+                let result =
+                    !(less || self.run_overridden_comparison_op(lhs_value, rhs_value, equal_op)?);
+                result.into()
             }
             (Object(o), _) => o.try_borrow()?.greater(rhs_value)?.into(),
             _ => return binary_op_error(lhs_value, rhs_value, Greater),
@@ -1842,7 +2017,7 @@ impl KotoVm {
     }
 
     fn run_greater_or_equal(&mut self, result: u8, lhs: u8, rhs: u8) -> Result<()> {
-        use BinaryOp::GreaterOrEqual;
+        use BinaryOp::{GreaterOrEqual, Less};
         use KValue::*;
 
         let lhs_value = self.get_register(lhs);
@@ -1851,9 +2026,19 @@ impl KotoVm {
             (Number(a), Number(b)) => Bool(a >= b),
             (Str(a), Str(b)) => Bool(a.as_str() >= b.as_str()),
             (Map(m), _) if m.contains_meta_key(&GreaterOrEqual.into()) => {
-                let op = m.get_meta_value(&GreaterOrEqual.into()).unwrap();
+                use macros::call_metamap_binary_op;
+                call_metamap_binary_op!(self, GreaterOrEqual, m, lhs_value, rhs_value, result);
+            }
+            (Map(m), _) if m.contains_meta_key(&Less.into()) => {
+                let lhs_value = lhs_value.clone();
                 let rhs_value = rhs_value.clone();
-                return self.call_overridden_binary_op(Some(result), lhs, rhs_value, op);
+                let less_op = m.get_meta_value(&Less.into()).unwrap();
+                let result = !self.run_overridden_comparison_op(
+                    lhs_value.clone(),
+                    rhs_value.clone(),
+                    less_op,
+                )?;
+                result.into()
             }
             (Object(o), _) => o.try_borrow()?.greater_or_equal(rhs_value)?.into(),
             _ => return binary_op_error(lhs_value, rhs_value, GreaterOrEqual),
@@ -1866,6 +2051,7 @@ impl KotoVm {
     fn run_equal(&mut self, result: u8, lhs: u8, rhs: u8) -> Result<()> {
         use BinaryOp::Equal;
         use KValue::*;
+        use macros::*;
 
         let lhs_value = self.get_register(lhs);
         let rhs_value = self.get_register(rhs);
@@ -1889,9 +2075,7 @@ impl KotoVm {
                 self.compare_value_ranges(&a, &b)?
             }
             (Map(m), _) if m.contains_meta_key(&Equal.into()) => {
-                let op = m.get_meta_value(&Equal.into()).unwrap();
-                let rhs_value = rhs_value.clone();
-                return self.call_overridden_binary_op(Some(result), lhs, rhs_value, op);
+                call_metamap_binary_op!(self, Equal, m, lhs_value, rhs_value, result);
             }
             (Map(map), _) => {
                 if let Map(rhs_map) = rhs_value {
@@ -1917,8 +2101,9 @@ impl KotoVm {
     }
 
     fn run_not_equal(&mut self, result: u8, lhs: u8, rhs: u8) -> Result<()> {
-        use BinaryOp::NotEqual;
+        use BinaryOp::{Equal, NotEqual};
         use KValue::*;
+        use macros::*;
 
         let lhs_value = self.get_register(lhs);
         let rhs_value = self.get_register(rhs);
@@ -1942,9 +2127,13 @@ impl KotoVm {
                 !self.compare_value_ranges(&a, &b)?
             }
             (Map(m), _) if m.contains_meta_key(&NotEqual.into()) => {
-                let op = m.get_meta_value(&NotEqual.into()).unwrap();
-                let rhs_value = rhs_value.clone();
-                return self.call_overridden_binary_op(Some(result), lhs, rhs_value, op);
+                call_metamap_binary_op!(self, NotEqual, m, lhs_value, rhs_value, result);
+            }
+            (Map(m), _) if m.contains_meta_key(&Equal.into()) => {
+                let op = m.get_meta_value(&Equal.into()).unwrap();
+                let equal =
+                    self.run_overridden_comparison_op(lhs_value.clone(), rhs_value.clone(), op)?;
+                !equal
             }
             (Map(map), _) => {
                 if let Map(rhs_map) = rhs_value {
@@ -1970,7 +2159,7 @@ impl KotoVm {
 
     fn compare_functions(&mut self, a: KFunction, b: KFunction) -> Result<bool> {
         if a.chunk == b.chunk && a.ip == b.ip {
-            match (&a.captures, &b.captures) {
+            match (a.captures(), b.captures()) {
                 (None, None) => Ok(true),
                 (Some(captures_a), Some(captures_b)) => {
                     let captures_a = captures_a.clone();
@@ -2033,7 +2222,7 @@ impl KotoVm {
         Ok(true)
     }
 
-    fn call_overridden_unary_op(
+    fn call_overridden_op_1(
         &mut self,
         result_register: Option<u8>,
         value_register: u8,
@@ -2051,33 +2240,79 @@ impl KotoVm {
                 packed_arg_count: 0,
             },
             op,
-            None,
         )
     }
 
-    fn call_overridden_binary_op(
+    fn call_overridden_op_2(
         &mut self,
         result_register: Option<u8>,
-        lhs_register: u8,
-        rhs: KValue,
+        instance: KValue,
+        arg: KValue,
         op: KValue,
     ) -> Result<()> {
         // Set up the call registers at the end of the stack
         let frame_base = self.new_frame_base()?;
 
-        self.registers.push(self.clone_register(lhs_register)); // Frame base
-        self.registers.push(rhs); // The rhs goes in the first arg register
+        self.registers.push(instance); // Frame base
+        self.registers.push(arg);
+
         self.call_callable(
             CallInfo {
                 result_register,
                 frame_base,
                 instance: Some(frame_base),
-                arg_count: 1, // 1 arg, the rhs value
+                arg_count: 1,
                 packed_arg_count: 0,
             },
             op,
-            None,
         )
+    }
+
+    fn call_overridden_op_3(
+        &mut self,
+        result_register: Option<u8>,
+        instance: KValue,
+        arg_1: KValue,
+        arg_2: KValue,
+        op: KValue,
+    ) -> Result<()> {
+        // Set up the call registers at the end of the stack
+        let frame_base = self.new_frame_base()?;
+
+        self.registers.push(instance); // Frame base
+        self.registers.push(arg_1);
+        self.registers.push(arg_2);
+
+        self.call_callable(
+            CallInfo {
+                result_register,
+                frame_base,
+                instance: Some(frame_base),
+                arg_count: 2,
+                packed_arg_count: 0,
+            },
+            op,
+        )
+    }
+
+    fn run_overridden_comparison_op(
+        &mut self,
+        lhs: KValue,
+        rhs: KValue,
+        op: KValue,
+    ) -> Result<bool> {
+        self.call_overridden_op_2(None, lhs, rhs, op)?;
+        self.frame_mut().execution_barrier = true;
+        match self.execute_instructions() {
+            Ok(result) => match result {
+                KValue::Bool(result) => Ok(result),
+                unexpected => unexpected_type("Bool", &unexpected),
+            },
+            Err(error) => {
+                self.pop_frame(KValue::Null)?;
+                Err(error)
+            }
+        }
     }
 
     fn run_jump_if_true(&mut self, register: u8, offset: u32) -> Result<()> {
@@ -2123,11 +2358,11 @@ impl KotoVm {
             Range(r) => r.size(),
             Map(m) if m.contains_meta_key(&size_key) => {
                 let op = m.get_meta_value(&size_key).unwrap();
-                return self.call_overridden_unary_op(Some(result_register), value_register, op);
+                return self.call_overridden_op_1(Some(result_register), value_register, op);
             }
             Map(m) => Some(m.len()),
             Object(o) => o.try_borrow()?.size(),
-            TemporaryTuple(RegisterSlice { count, .. }) => Some(*count as usize),
+            TemporaryTuple(RegisterSlice { count, .. }) => Some(*count),
             _ => None,
         };
 
@@ -2142,28 +2377,40 @@ impl KotoVm {
         }
     }
 
-    fn run_import(&mut self, import_register: u8) -> Result<()> {
+    fn successful_import(
+        &mut self,
+        import_register: u8,
+        imported: KValue,
+        import_all: bool,
+    ) -> Result<()> {
+        self.set_register(import_register, imported.clone());
+
+        if import_all {
+            self.frame_mut()
+                .non_locals
+                .get_or_insert_default()
+                .add_wildcard_import(imported);
+        }
+
+        Ok(())
+    }
+
+    fn run_import(&mut self, import_register: u8, import_all: bool) -> Result<()> {
         let import_name = match self.clone_register(import_register) {
             KValue::Str(s) => s,
             value @ KValue::Map(_) => {
-                self.set_register(import_register, value);
-                return Ok(());
+                return self.successful_import(import_register, value, import_all);
             }
             other => return unexpected_type("import id or string, or accessible value", &other),
         };
 
-        // Is the import in the exports?
-        let maybe_in_exports = self.exports.get(&import_name);
-        if let Some(value) = maybe_in_exports {
-            self.set_register(import_register, value);
-            return Ok(());
-        }
-
-        // Is the import in the prelude?
-        let maybe_in_prelude = self.context.prelude.get(&import_name);
-        if let Some(value) = maybe_in_prelude {
-            self.set_register(import_register, value);
-            return Ok(());
+        // Is the import available as a non-local?
+        let maybe_non_local = self
+            .frame()
+            .non_local(&import_name)
+            .or_else(|| self.context.prelude.get(&import_name));
+        if let Some(value) = maybe_non_local {
+            return self.successful_import(import_register, value, import_all);
         }
 
         // Attempt to compile the imported module from disk,
@@ -2179,7 +2426,7 @@ impl KotoVm {
         // Has the module been loaded previously?
         let maybe_in_cache = self
             .context
-            .imported_modules
+            .module_cache
             .borrow()
             .get(&compile_result.path)
             .cloned();
@@ -2190,8 +2437,7 @@ impl KotoVm {
                 return runtime_error!("recursive import of module '{import_name}'");
             }
             Some(Some(cached_exports)) if compile_result.loaded_from_cache => {
-                self.set_register(import_register, KValue::Map(cached_exports));
-                return Ok(());
+                return self.successful_import(import_register, cached_exports.into(), import_all);
             }
             _ => {}
         }
@@ -2204,7 +2450,7 @@ impl KotoVm {
 
         // Insert a placeholder for the new module, preventing recursive imports
         self.context
-            .imported_modules
+            .module_cache
             .borrow_mut()
             .insert(compile_result.path.clone(), None);
 
@@ -2240,18 +2486,20 @@ impl KotoVm {
                 callback(&compile_result.path);
             }
 
-            // Cache the module's resulting exports and assign them to the import register
+            // Cache the module's resulting exports
             let module_exports = self.exports.clone();
             self.context
-                .imported_modules
+                .module_cache
                 .borrow_mut()
                 .insert(compile_result.path, Some(module_exports.clone()));
-            self.set_register(import_register, KValue::Map(module_exports));
+
+            self.successful_import(import_register, module_exports.into(), import_all)
+                .ok();
         } else {
             // If there was an error while importing the module then make sure that the
             // placeholder is removed from the imported modules cache.
             self.context
-                .imported_modules
+                .module_cache
                 .borrow_mut()
                 .remove(&compile_result.path);
         }
@@ -2261,7 +2509,7 @@ impl KotoVm {
         import_result
     }
 
-    fn run_index_mut(
+    fn run_index_assign(
         &mut self,
         indexable_register: u8,
         index_register: u8,
@@ -2295,32 +2543,12 @@ impl KotoVm {
                 }
                 Ok(())
             }
-            Map(map) if map.contains_meta_key(&MetaKey::IndexMut) => {
-                let index_mut_fn = map.get_meta_value(&MetaKey::IndexMut).unwrap();
+            Map(map) if map.contains_meta_key(&WriteOp::IndexAssign.into()) => {
+                let op = map.get_meta_value(&WriteOp::IndexAssign.into()).unwrap();
                 let index_value = index_value.clone();
                 let value = value.clone();
 
-                // Set up the function call.
-                let frame_base = self.new_frame_base()?;
-                // The result of a mutable index assignment is always the RHS, so the
-                // function result can be placed in the frame base where it will be
-                // immediately discarded.
-                let result_register = None;
-                self.registers.push(map.into()); // Frame base; the map is `self` for `@index_mut`.
-                self.registers.push(index_value);
-                self.registers.push(value);
-                self.call_callable(
-                    CallInfo {
-                        result_register,
-                        frame_base,
-                        instance: Some(frame_base),
-                        arg_count: 2,
-                        packed_arg_count: 0,
-                    },
-                    index_mut_fn,
-                    None,
-                )?;
-                Ok(())
+                self.call_overridden_op_3(None, map.into(), index_value, value, op)
             }
             Map(map) => match index_value {
                 Number(index) => {
@@ -2348,7 +2576,7 @@ impl KotoVm {
                 }
                 unexpected => unexpected_type("Number", unexpected),
             },
-            Object(o) => o.try_borrow_mut()?.index_mut(index_value, value),
+            Object(o) => o.try_borrow_mut()?.index_assign(index_value, value),
             unexpected => unexpected_type("a mutable indexable value", &unexpected),
         }
     }
@@ -2358,10 +2586,10 @@ impl KotoVm {
 
         if n < 0.0 {
             return runtime_error!("negative indices aren't allowed ('{n}')");
-        } else if let Some(size) = size {
-            if index >= size {
-                return runtime_error!("index out of bounds - index: {n}, size: {size}");
-            }
+        } else if let Some(size) = size
+            && index >= size
+        {
+            return runtime_error!("index out of bounds - index: {n}, size: {size}");
         }
 
         Ok(index)
@@ -2417,14 +2645,9 @@ impl KotoVm {
                 };
                 Str(result)
             }
-            (Map(m), index) if m.contains_meta_key(&BinaryOp::Index.into()) => {
-                let op = m.get_meta_value(&BinaryOp::Index.into()).unwrap();
-                return self.call_overridden_binary_op(
-                    Some(result_register),
-                    value_register,
-                    index,
-                    op,
-                );
+            (Map(m), index) if m.contains_meta_key(&ReadOp::Index.into()) => {
+                let op = m.get_meta_value(&ReadOp::Index.into()).unwrap();
+                return self.call_overridden_op_2(Some(result_register), value, index, op);
             }
             (Map(m), Number(n)) => {
                 let entries = m.data();
@@ -2435,6 +2658,15 @@ impl KotoVm {
                 };
                 let result = KTuple::from(vec![key.value().clone(), value.clone()]);
                 Tuple(result)
+            }
+            (Range(r), Number(n)) if r.start().is_some() => {
+                let start = r.start().unwrap();
+                let index = self.validate_index(n, r.size())?;
+                if r.is_ascending() {
+                    Number((start + index as i64).into())
+                } else {
+                    Number((start - index as i64).into())
+                }
             }
             (Object(o), index) => o.try_borrow()?.index(&index)?,
             (unexpected_value, unexpected_index) => {
@@ -2451,30 +2683,30 @@ impl KotoVm {
         Ok(())
     }
 
-    fn run_map_insert(
+    fn run_access_assign(
         &mut self,
         map_register: u8,
         key_register: u8,
         value_register: u8,
     ) -> Result<()> {
-        let key = ValueKey::try_from(self.clone_register(key_register))?;
-        let value = self.clone_register(value_register);
+        let key = self.get_register(key_register);
+        let value = self.get_register(value_register);
 
         match self.get_register(map_register) {
+            KValue::Map(map) if map.contains_meta_key(&WriteOp::AccessAssign.into()) => {
+                let op = map.get_meta_value(&WriteOp::AccessAssign.into()).unwrap();
+                self.call_overridden_op_3(None, map.clone().into(), key.clone(), value.clone(), op)
+            }
             KValue::Map(map) => {
-                map.data_mut().insert(key, value);
+                let key = ValueKey::try_from(key.clone())?;
+                map.data_mut().insert(key, value.clone());
                 Ok(())
             }
-            KValue::Object(o) => {
-                let o = o.try_borrow()?;
-                if let Some(entries) = o.entries() {
-                    entries.insert(key, value);
-                    Ok(())
-                } else {
-                    runtime_error!("insertion not supported for '{}'", o.type_string())
-                }
-            }
-            unexpected => unexpected_type("a value that supports insertion", unexpected),
+            KValue::Object(o) => match key {
+                KValue::Str(key) => o.try_borrow_mut()?.access_assign(key, value),
+                unexpected => unexpected_type("String", unexpected),
+            },
+            unexpected => unexpected_type("a value that supports assignment via '.'", unexpected),
         }
     }
 
@@ -2557,6 +2789,36 @@ impl KotoVm {
         value_register: u8,
         key_string: KString,
     ) -> Result<()> {
+        self.run_access_inner(result_register, value_register, key_string, true)?;
+        Ok(())
+    }
+
+    fn run_try_access(
+        &mut self,
+        result_register: u8,
+        value_register: u8,
+        key_string: KString,
+        jump_offset: u32,
+    ) -> Result<()> {
+        if !self.run_access_inner(result_register, value_register, key_string, false)? {
+            self.jump_ip(jump_offset);
+        }
+        Ok(())
+    }
+
+    // Runs `.` access on a value.
+    //
+    // If the given key was found then `true` will be returned.
+    //
+    // If `error_if_not_found` is `true`, then an error will be returned if the key wasn't found,
+    // otherwise `false` will be returned.
+    fn run_access_inner(
+        &mut self,
+        result_register: u8,
+        value_register: u8,
+        key_string: KString,
+        error_if_not_found: bool,
+    ) -> Result<bool> {
         use KValue::*;
 
         let accessed_value = self.clone_register(value_register);
@@ -2564,13 +2826,18 @@ impl KotoVm {
 
         macro_rules! core_op {
             ($module:ident, $iterator_fallback:expr) => {{
-                let op = self.get_core_op(
+                if let Some(op) = self.get_core_op(
                     &key,
                     &self.context.core_lib.$module,
                     $iterator_fallback,
                     stringify!($module),
-                )?;
-                self.set_register(result_register, op);
+                    error_if_not_found,
+                )? {
+                    self.set_register(result_register, op);
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
             }};
         }
 
@@ -2581,6 +2848,11 @@ impl KotoVm {
             Str(_) => core_op!(string, true),
             Tuple(_) => core_op!(tuple, true),
             Iterator(_) => core_op!(iterator, false),
+            Map(map) if map.contains_meta_key(&ReadOp::Access.into()) => {
+                let op = map.get_meta_value(&ReadOp::Access.into()).unwrap();
+                self.call_overridden_op_2(Some(result_register), accessed_value, key.into(), op)?;
+                Ok(true)
+            }
             Map(map) => {
                 let mut access_map = map.clone();
                 let mut access_result = None;
@@ -2590,8 +2862,7 @@ impl KotoVm {
                         Some(value) => access_result = Some(value),
                         // Fallback to the map module when there's no metamap
                         None if access_map.meta_map().is_none() => {
-                            core_op!(map, true);
-                            return Ok(());
+                            return core_op!(map, error_if_not_found);
                         }
                         _ => match access_map.get_meta_value(&MetaKey::Named(key_string.clone())) {
                             Some(value) => access_result = Some(value),
@@ -2614,51 +2885,63 @@ impl KotoVm {
                     && (map.contains_meta_key(&UnaryOp::Iterator.into())
                         || map.contains_meta_key(&UnaryOp::Next.into()))
                 {
-                    access_result = Some(self.get_core_op(
+                    access_result = self.get_core_op(
                         &key,
                         &self.context.core_lib.iterator,
                         false,
                         &accessed_value.type_as_string(),
-                    )?);
+                        error_if_not_found,
+                    )?;
                 }
 
-                let Some(value) = access_result else {
-                    return runtime_error!(
-                        "'{key}' not found in '{}'",
-                        accessed_value.type_as_string()
-                    );
-                };
-
-                self.set_register(result_register, value);
+                match access_result {
+                    Some(value) => {
+                        self.set_register(result_register, value);
+                        Ok(true)
+                    }
+                    None => {
+                        if error_if_not_found {
+                            runtime_error!(
+                                "'{key}' not found in '{}'",
+                                accessed_value.type_as_string()
+                            )
+                        } else {
+                            Ok(false)
+                        }
+                    }
+                }
             }
             Object(o) => {
                 let o = o.try_borrow()?;
 
                 let mut result = None;
-                if let Some(entries) = o.entries() {
-                    result = entries.get(&key);
+
+                if let KValue::Str(key) = key.value() {
+                    result = o.access(key)?;
                 }
 
                 // Iterator fallback?
                 if result.is_none() && !matches!(o.is_iterable(), IsIterable::NotIterable) {
-                    result = Some(self.get_core_op(
+                    result = self.get_core_op(
                         &key,
                         &self.context.core_lib.iterator,
                         false,
                         &o.type_string(),
-                    )?);
+                        error_if_not_found,
+                    )?;
                 }
 
                 if let Some(result) = result {
                     self.set_register(result_register, result);
+                    Ok(true)
+                } else if error_if_not_found {
+                    runtime_error!("'{key}' not found in '{}'", o.type_string())
                 } else {
-                    return runtime_error!("'{key}' not found in '{}'", o.type_string());
+                    Ok(false)
                 }
             }
-            unexpected => return unexpected_type("Value that supports '.' access", unexpected),
+            unexpected => unexpected_type("a value that supports '.' access", unexpected),
         }
-
-        Ok(())
     }
 
     fn get_core_op(
@@ -2667,16 +2950,19 @@ impl KotoVm {
         module: &KMap,
         iterator_fallback: bool,
         module_name: &str,
-    ) -> Result<KValue> {
+        error_if_not_found: bool,
+    ) -> Result<Option<KValue>> {
         let maybe_op = match module.get(key) {
             None if iterator_fallback => self.context.core_lib.iterator.get(key),
             maybe_op => maybe_op,
         };
 
         if let Some(result) = maybe_op {
-            Ok(result)
+            Ok(Some(result))
+        } else if error_if_not_found {
+            runtime_error!("'{key}' not found in the '{module_name}' module")
         } else {
-            runtime_error!("'{key}' not found in '{module_name}'")
+            Ok(None)
         }
     }
 
@@ -2710,12 +2996,7 @@ impl KotoVm {
     }
 
     // Similar to `call_koto_function`, but sets up the frame in a new VM for the generator
-    fn call_generator(
-        &mut self,
-        call_info: &CallInfo,
-        f: &KFunction,
-        temp_tuple_values: Option<&[KValue]>,
-    ) -> Result<()> {
+    fn call_generator(&mut self, call_info: &CallInfo, f: &KFunction) -> Result<()> {
         // Spawn a VM for the generator
         let mut generator_vm = self.spawn_shared_vm();
         // Push a frame for running the generator function
@@ -2724,6 +3005,7 @@ impl KotoVm {
             f.ip,
             0, // Arguments will be copied starting in register 0
             None,
+            f.non_locals(),
         );
         // Set the generator VM's state as suspended
         generator_vm.execution_state = ExecutionState::Suspended;
@@ -2773,8 +3055,8 @@ impl KotoVm {
             expected_arg_count,
         )?;
 
-        // Captures and temp tuple values are placed in the registerst following the arguments
-        apply_captures_and_temp_tuple_values(&mut generator_vm.registers, f, temp_tuple_values);
+        // Captures and temp tuple values are placed in the registers following the arguments
+        apply_captures(&mut generator_vm.registers, f);
 
         // Move the generator vm into an iterator and then place it in the result register
         if let Some(result_register) = call_info.result_register {
@@ -2784,12 +3066,7 @@ impl KotoVm {
         Ok(())
     }
 
-    fn call_koto_function(
-        &mut self,
-        call_info: &CallInfo,
-        f: &KFunction,
-        temp_tuple_values: Option<&[KValue]>,
-    ) -> Result<()> {
+    fn call_koto_function(&mut self, call_info: &CallInfo, f: &KFunction) -> Result<()> {
         debug_assert!(!f.flags.is_generator());
 
         // The caller instance is in the frame base register,
@@ -2820,7 +3097,7 @@ impl KotoVm {
         )?;
 
         // Captures and temp tuple values are placed in the registers following the arguments
-        apply_captures_and_temp_tuple_values(&mut self.registers, f, temp_tuple_values);
+        apply_captures(&mut self.registers, f);
 
         // Set up a new frame for the called function
         self.push_frame(
@@ -2828,17 +3105,13 @@ impl KotoVm {
             f.ip,
             call_info.frame_base,
             call_info.result_register,
+            f.non_locals(),
         );
 
         Ok(())
     }
 
-    fn call_callable(
-        &mut self,
-        mut info: CallInfo,
-        callable: KValue,
-        temp_tuple_values: Option<&[KValue]>,
-    ) -> Result<()> {
+    fn call_callable(&mut self, mut info: CallInfo, callable: KValue) -> Result<()> {
         use KValue::*;
 
         if let Some(instance) = info.instance {
@@ -2858,9 +3131,9 @@ impl KotoVm {
         match callable {
             Function(f) => {
                 if f.flags.is_generator() {
-                    self.call_generator(&info, &f, temp_tuple_values)
+                    self.call_generator(&info, &f)
                 } else {
-                    self.call_koto_function(&info, &f, temp_tuple_values)
+                    self.call_koto_function(&info, &f)
                 }
             }
             NativeFunction(f) => self.call_native_function(&info, ExternalCallable::Function(f)),
@@ -2876,7 +3149,6 @@ impl KotoVm {
                         ..info
                     },
                     f,
-                    temp_tuple_values,
                 )
             }
             unexpected => unexpected_type("callable function", &unexpected),
@@ -2922,7 +3194,11 @@ impl KotoVm {
             let iterable = self.registers.swap_remove(unpack_index);
 
             // Convert the value into an iterator
-            let iterator = self.make_iterator(iterable)?;
+            let iterator = self.make_iterator(iterable).map_err(|error| {
+                error.with_context(format!(
+                    "while unpacking argument at index {packed_arg_register}"
+                ))
+            })?;
 
             // Process the iterator output, checking for errors and collecting `ValuePair`s
             let max_unpacked_args = (u8::MAX - info.arg_count - 1) as usize; // -1 for frame base
@@ -2971,7 +3247,7 @@ impl KotoVm {
         ) {
             (Some(span), Some(path)) => format!("[{}: {}] ", path, span.start.line + 1),
             (Some(span), None) => format!("[{}] ", span.start.line + 1),
-            (None, Some(path)) => format!("[{}: #ERR] ", path),
+            (None, Some(path)) => format!("[{path}: #ERR] "),
             (None, None) => "[#ERR] ".to_string(),
         };
 
@@ -3248,6 +3524,18 @@ impl KotoVm {
         self.reader.chunk.clone()
     }
 
+    /// The ip that produced the most recently executed instruction
+    ///
+    /// For native functions accessing the VM from [`CallContext`] or [`MethodContext`],
+    /// this will refer to the call instruction currently being executed,
+    /// which can be useful for building error messages with more informative stack traces.
+    pub fn instruction_frame(&self) -> InstructionFrame {
+        InstructionFrame {
+            chunk: self.chunk(),
+            instruction: self.instruction_ip,
+        }
+    }
+
     fn set_chunk_and_ip(&mut self, chunk: Ptr<Chunk>, ip: u32) {
         self.reader = InstructionReader {
             chunk,
@@ -3286,25 +3574,28 @@ impl KotoVm {
     // - The `frame_base` register should already exist in the register stack.
     // - If the new frame's return value should be copied to a register in the calling frame,
     //   then `return_register` should be lower in the stack than `frame_base`.
+    // - The frame will use the provided `non_locals` if they're defined, otherwise the frame will
+    //   inherit the parent's non-locals.
     fn push_frame(
         &mut self,
         chunk: Ptr<Chunk>,
         ip: u32,
         frame_base: u8,
         return_register: Option<u8>,
+        non_locals: Option<NonLocals>,
     ) {
         let return_ip = self.ip();
         if let Some(frame) = self.call_stack.last_mut() {
             frame.return_instruction_ip = self.instruction_ip;
             frame.return_resume_ip = return_ip;
             frame.return_value_register = return_register;
-        }
+        };
 
         let previous_frame_base = self.register_base;
         let new_frame_base = previous_frame_base + frame_base as usize;
 
         self.call_stack
-            .push(Frame::new(chunk.clone(), new_frame_base));
+            .push(Frame::new(chunk.clone(), non_locals, new_frame_base));
         self.register_base = new_frame_base;
         self.set_chunk_and_ip(chunk, ip);
     }
@@ -3367,7 +3658,7 @@ impl KotoVm {
         mut error: Error,
         allow_catch: bool,
     ) -> Result<(u8, u32)> {
-        error.extend_trace(self.chunk(), self.instruction_ip);
+        error.extend_trace(self.instruction_frame());
 
         while let Some(frame) = self.call_stack.last() {
             match frame.catch_stack.last() {
@@ -3382,7 +3673,7 @@ impl KotoVm {
                     self.pop_frame(KValue::Null)?;
 
                     if !self.call_stack.is_empty() {
-                        error.extend_trace(self.chunk(), self.instruction_ip);
+                        error.extend_trace(self.instruction_frame());
                     }
                 }
             }
@@ -3405,6 +3696,7 @@ impl KotoVm {
         (self.registers.len() - self.register_base) as u8
     }
 
+    // Sets the register, which must already be available in the stack
     fn set_register(&mut self, register: u8, value: KValue) {
         let index = self.register_index(register);
         self.registers[index] = value;
@@ -3448,13 +3740,19 @@ impl KotoVm {
         &mut self.registers[index]
     }
 
-    pub(crate) fn register_slice(&self, register: u8, count: u8) -> &[KValue] {
+    // Provides a slice of registers, with a start register relative to the current frame base.
+    pub(crate) fn register_slice(&self, start: u8, count: u8) -> &[KValue] {
         if count > 0 {
-            let start = self.register_index(register);
+            let start = self.register_index(start);
             &self.registers[start..start + count as usize]
         } else {
             &[]
         }
+    }
+
+    // Provides a slice of registers, with a start register index in the register stack.
+    pub(crate) fn register_slice_raw(&self, start: usize, count: usize) -> &[KValue] {
+        &self.registers[start..start + count]
     }
 
     fn truncate_registers(&mut self, len: u8) {
@@ -3513,7 +3811,7 @@ fn apply_optional_arguments(
             });
         }
 
-        let Some(captures) = f.captures.as_ref() else {
+        let Some(captures) = f.captures() else {
             // Non-zero default arg count without captures is unexpected
             return runtime_error!(ErrorKind::UnexpectedError);
         };
@@ -3569,12 +3867,8 @@ fn apply_variadic_arguments(
 }
 
 // See [KotoVm::call_koto_function] and [KotoVm::call_generator]
-fn apply_captures_and_temp_tuple_values(
-    registers: &mut Vec<KValue>,
-    f: &KFunction,
-    temp_tuple_values: Option<&[KValue]>,
-) {
-    if let Some(captures) = &f.captures {
+fn apply_captures(registers: &mut Vec<KValue>, f: &KFunction) {
+    if let Some(captures) = f.captures() {
         // Copy the captures list into the registers following the args
         registers.extend(
             captures
@@ -3583,11 +3877,6 @@ fn apply_captures_and_temp_tuple_values(
                 .skip(f.optional_arg_count as usize)
                 .cloned(),
         );
-    }
-
-    // Place any temp tuple values in the registers following the args and captures
-    if let Some(temp_tuple_values) = temp_tuple_values {
-        registers.extend_from_slice(temp_tuple_values);
     }
 }
 
@@ -3610,7 +3899,7 @@ pub(crate) fn clone_generator_vm(vm: &KotoVm) -> Result<KotoVm> {
 /// Function call arguments
 ///
 /// Typical use will be to use the `From` implementations, either providing a single value that
-/// implements `Into<KValue>`, or an array or slice of `KValue`s.
+/// implements `Into<KValue>`, or an array or slice of [KValue]s.
 ///
 /// See [KotoVm::call_function].
 pub enum CallArgs<'a> {
@@ -3623,7 +3912,7 @@ pub enum CallArgs<'a> {
     /// Arguments are bundled together as a tuple and then passed to the function.
     ///
     /// If the called function unpacks the tuple in its arguments list,
-    /// then a temporary tuple will be used, which avoids the allocation of a regular KTuple.
+    /// then a temporary tuple will be used, which avoids the allocation of a regular [KTuple].
     AsTuple(&'a [KValue]),
 }
 
@@ -3654,10 +3943,12 @@ impl<'a, const N: usize> From<&'a [KValue; N]> for CallArgs<'a> {
 type ModuleCache = HashMap<PathBuf, Option<KMap>, BuildHasherDefault<FxHasher>>;
 
 // A frame in the VM's call stack
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct Frame {
     // The chunk being interpreted in this frame
     pub chunk: Ptr<Chunk>,
+    // The non-local values that are available within this frame
+    pub non_locals: Option<NonLocals>,
     // The index in the VM's value stack of the first frame register.
     // The frame's instance is always in register 0 (Null if not set).
     // Call arguments followed by local values are in registers starting from index 1.
@@ -3682,9 +3973,10 @@ struct Frame {
 }
 
 impl Frame {
-    pub fn new(chunk: Ptr<Chunk>, register_base: usize) -> Self {
+    fn new(chunk: Ptr<Chunk>, non_locals: Option<NonLocals>, register_base: usize) -> Self {
         Self {
             chunk,
+            non_locals,
             register_base,
             required_registers: 0,
             return_resume_ip: 0,
@@ -3692,6 +3984,58 @@ impl Frame {
             return_instruction_ip: 0,
             catch_stack: vec![],
             execution_barrier: false,
+        }
+    }
+
+    fn non_local(&self, name: &str) -> Option<KValue> {
+        self.non_locals
+            .as_ref()
+            .and_then(|non_locals| non_locals.get(name))
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct NonLocals {
+    wildcard_imports: Option<Ptr<Vec<KValue>>>,
+    module_exports: KMap,
+}
+
+impl NonLocals {
+    fn get(&self, name: &str) -> Option<KValue> {
+        if let Some(wildcard_imports) = &self.wildcard_imports {
+            // Check any wildcard imports in reverse order (most recent import takes precedence)
+            for wildcard_import in wildcard_imports.iter().rev() {
+                let result = match wildcard_import {
+                    KValue::Map(m) => m.get(name),
+                    KValue::Object(o) => o
+                        .try_borrow()
+                        .ok()
+                        .and_then(|o| o.access(&name.into()).ok().flatten()),
+                    _ => None,
+                };
+                if let Some(result) = result {
+                    return Some(result);
+                }
+            }
+        }
+
+        // Check the module's exports
+        self.module_exports.get(name)
+    }
+
+    fn add_wildcard_import(&mut self, new_import: KValue) {
+        let already_imported = self
+            .wildcard_imports
+            .as_ref()
+            .and_then(|imports| {
+                imports
+                    .iter()
+                    .find(|import| import.is_same_instance(&new_import))
+            })
+            .is_some();
+
+        if !already_imported {
+            Ptr::make_mut(self.wildcard_imports.get_or_insert_default()).push(new_import);
         }
     }
 }
@@ -3788,4 +4132,262 @@ impl ExecutionTimeout {
 pub enum ReturnOrYield {
     Return(KValue),
     Yield(KValue),
+}
+
+// A collection of macros that avoid duplicated boilerplate in the various operator functions
+mod macros {
+    macro_rules! call_metamap_binary_op_rhs {
+        ($self:expr, $op:ident, $map:expr, $lhs_value:expr, $rhs_value:expr, $result_register:expr) => {{
+            let op = $map.get_meta_value(&$op.into()).unwrap();
+            let lhs_value = $lhs_value.clone();
+            let rhs_value = $rhs_value.clone();
+            // Call the op, swapping the LHS and RHS
+            return $self.call_overridden_op_2(Some($result_register), rhs_value, lhs_value, op);
+        }};
+    }
+
+    macro_rules! call_object_binary_op {
+        ($op:ident, $trait_fn:ident, $object:expr, $lhs_value:expr, $rhs_value:expr) => {{
+            match $object.try_borrow()?.$trait_fn($lhs_value) {
+                Ok(result) => result,
+                Err(error) => {
+                    if error.is_unimplemented_error() {
+                        return binary_op_error($lhs_value, $rhs_value, $op);
+                    } else {
+                        return Err(error);
+                    }
+                }
+            }
+        }};
+    }
+
+    macro_rules! call_metamap_binary_op {
+        // Used when the call result needs to be assigned to a register, (e.g. Add)
+        ($self:expr, $op:ident, $map:expr, $lhs_value:expr, $rhs_value:expr, $result_register:expr) => {{
+            let op = $map.get_meta_value(&$op.into()).unwrap();
+            let lhs_value = $lhs_value.clone();
+            let rhs_value = $rhs_value.clone();
+
+            return $self.call_overridden_op_2(Some($result_register), lhs_value, rhs_value, op);
+        }};
+
+        // Used when the call result can be discarded, the result is always the modified LHS
+        // (e.g. AddAssign)
+        ($self:expr, $op:ident, $map:expr, $lhs_value:expr, $rhs_value:expr) => {{
+            let op = $map.get_meta_value(&$op.into()).unwrap();
+            let lhs_value = $lhs_value.clone();
+            let rhs_value = $rhs_value.clone();
+            return $self.call_overridden_op_2(None, lhs_value, rhs_value, op);
+        }};
+    }
+
+    // Arithmetic ops fall back to the RHS when possible
+    macro_rules! call_metamap_arithmetic_op {
+        ($self:expr, $op:ident, $op_rhs:ident, $trait_fn:ident, $trait_fn_rhs:ident, $map:expr, $lhs:expr, $rhs:expr, $result_register:expr) => {{
+            let op = $map.get_meta_value(&$op.into()).unwrap();
+
+            // Call the map's op function
+            $self.call_overridden_op_2(
+                Some($result_register),
+                $lhs.clone(),
+                $rhs.clone(),
+                op,
+            )?;
+
+            // Execute the function immediately so that we can check for `koto.unimplemented` errors
+            // - Enable the execution barrier on the function's frame so errors aren't propagated
+            $self.frame_mut().execution_barrier = true;
+            match $self.execute_instructions() {
+                Ok(result) => result,
+                Err(error) => {
+                    // Pop the frame given that an error has been thrown
+                    $self.pop_frame(KValue::Null)?;
+                    // Check for a `koto.unimplemented` error
+                    let ErrorKind::KotoError { thrown_value, .. } = &error.error else {
+                        // A non-unimplemented error was thrown, so propagate it
+                        return Err(error);
+                    };
+
+                    if !matches!(thrown_value, KValue::Object(o) if o.is_a::<Unimplemented>()) {
+                        // A non-unimplemented error was thrown, so propagate it
+                        return Err(error);
+                    }
+
+                    match &$rhs {
+                        Object(o_rhs) => {
+                            call_object_binary_op!($op_rhs, $trait_fn_rhs, o_rhs, &$lhs, &$rhs).into()
+                        }
+                        Map(m) if m.contains_meta_key(&$op_rhs.into()) => {
+                            call_metamap_binary_op_rhs!(
+                                $self,
+                                $op_rhs,
+                                m,
+                                $lhs,
+                                $rhs,
+                                $result_register
+                            );
+                        }
+                        _ => return binary_op_error(&$lhs, &$rhs, $op),
+                    }
+                }
+            }
+        }};
+
+        ($self:expr, $op:ident, $trait_fn:ident, $map:expr, $lhs:expr, $rhs:expr, $result_register:expr) => {
+            paste::paste! {
+                call_metamap_arithmetic_op!(
+                    $self,
+                    $op,
+                    [<$op Rhs>],
+                    $trait_fn,
+                    [<$trait_fn _rhs>],
+                    $map,
+                    $lhs,
+                    $rhs,
+                    $result_register
+                )
+            }
+        };
+    }
+
+    // Arithmetic ops fall back to the RHS when possible
+    macro_rules! call_object_arithmetic_op {
+        ($self:expr,
+         $op:ident,
+         $op_rhs:ident,
+         $trait_fn:ident,
+         $trait_fn_rhs:ident,
+         $object:expr,
+         $lhs_value:expr,
+         $rhs_value:expr,
+         $result_register:expr) => {{
+            let object = $object.clone();
+            match object.try_borrow()?.$trait_fn($rhs_value) {
+                Ok(result) => result,
+                Err(error) if error.is_unimplemented_error() => match $rhs_value {
+                    Object(o_rhs) => {
+                        call_object_binary_op!(
+                            $op_rhs,
+                            $trait_fn_rhs,
+                            o_rhs,
+                            $lhs_value,
+                            $rhs_value
+                        )
+                    }
+                    Map(m) if m.contains_meta_key(&$op_rhs.into()) => {
+                        call_metamap_binary_op_rhs!(
+                            $self,
+                            $op_rhs,
+                            m,
+                            $lhs_value,
+                            $rhs_value,
+                            $result_register
+                        );
+                    }
+                    _ => return binary_op_error($lhs_value, $rhs_value, $op),
+                },
+                Err(error) => return Err(error),
+            }
+        }};
+
+        ($self:expr,
+         $op:ident,
+         $trait_fn:ident,
+         $object:expr,
+         $lhs_value:expr,
+         $rhs_value:expr,
+         $result_register:expr) => {{
+            paste::paste! {
+                call_object_arithmetic_op!(
+                    $self,
+                    $op,
+                    [<$op Rhs>],
+                    $trait_fn,
+                    [<$trait_fn _rhs>],
+                    $object,
+                    $lhs_value,
+                    $rhs_value,
+                    $result_register
+                )
+            }
+        }};
+    }
+
+    macro_rules! run_arithmetic_op {
+        ($self:expr,
+         $op:ident,
+         $trait_fn:ident,
+         $op_expr:expr,
+         $result:expr,
+         $lhs:expr,
+         $rhs:expr) => {{
+             paste::paste! {
+                use BinaryOp::{$op, [<$op Rhs>]};
+                use KValue::{Map, Number, Object};
+                use macros::*;
+
+                let lhs_value = $self.get_register($lhs);
+                let rhs_value = $self.get_register($rhs);
+                let result_value = match (lhs_value, rhs_value) {
+                    (Number(a), Number(b)) => Number($op_expr(a, b)),
+                    (Map(m), _) if m.contains_meta_key(&$op.into()) => {
+                        let lhs_value = lhs_value.clone();
+                        let rhs_value = rhs_value.clone();
+                        call_metamap_arithmetic_op!($self, $op, $trait_fn, m, lhs_value, rhs_value, $result)
+                    }
+                    (Object(o), _) => {
+                        call_object_arithmetic_op!($self, $op, $trait_fn, o, lhs_value, rhs_value, $result)
+                    }
+                    (_, Map(m)) if m.contains_meta_key(&[<$op Rhs>].into()) => {
+                        call_metamap_binary_op_rhs!($self, [<$op Rhs>], m, lhs_value, rhs_value, $result);
+                    }
+                    (_, Object(o)) => {
+                        call_object_binary_op!([<$op Rhs>], [<$trait_fn _rhs>], o, lhs_value, rhs_value)
+                    }
+                    _ => return binary_op_error(lhs_value, rhs_value, $op),
+                };
+                $self.set_register($result, result_value);
+
+                Ok(())
+            }
+        }};
+    }
+
+    macro_rules! run_compound_assign_op {
+        ($self:expr,
+         $op:ident,
+         $trait_fn:ident,
+         $op_expr:expr,
+         $lhs:expr,
+         $rhs:expr) => {{
+            paste::paste! {
+                use BinaryOp::$op;
+                use KValue::{Map, Number, Object};
+
+                let lhs_value = $self.get_register($lhs);
+                let rhs_value = $self.get_register($rhs);
+                match (lhs_value, rhs_value) {
+                    (Number(a), Number(b)) => {
+                        $self.set_register($lhs, Number($op_expr(a, b)));
+                        Ok(())
+                    }
+                    (Map(m), _) if m.contains_meta_key(&$op.into()) => {
+                        macros::call_metamap_binary_op!($self, $op, m, lhs_value, rhs_value);
+                    }
+                    (Object(o), Object(o2)) if o2.is_same_instance(o2) => {
+                        let o2 = Object(o2.try_borrow()?.copy());
+                        o.try_borrow_mut()?.$trait_fn(&o2)
+                    }
+                    (Object(o), _) => o.try_borrow_mut()?.$trait_fn(rhs_value),
+                    _ => binary_op_error(lhs_value, rhs_value, $op),
+                }
+            }
+        }};
+    }
+
+    pub(crate) use {
+        call_metamap_arithmetic_op, call_metamap_binary_op, call_metamap_binary_op_rhs,
+        call_object_arithmetic_op, call_object_binary_op, run_arithmetic_op,
+        run_compound_assign_op,
+    };
 }

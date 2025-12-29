@@ -14,12 +14,15 @@ pub enum ErrorKind {
     ///
     /// The value will either be a String, or a value that implements @display, in which case the
     /// @display function will be evaluated by the included VM when displaying the error.
-    #[error("{}", display_thrown_value(thrown_value, vm))]
+    #[error("{}", display_thrown_value(thrown_value, vm.as_deref()))]
     KotoError {
         /// The thrown value
         thrown_value: KValue,
         /// A VM that should be used to format the thrown value
-        vm: KotoVm,
+        //
+        // This is None by default, and initialized to Some when errors aren't caught within a
+        // script and are being propagated outside of the runtime, see Vm::execute_instructions.
+        vm: Option<Box<KotoVm>>,
     },
     #[error("execution timed out (the limit of {} seconds was reached)", .0.as_secs_f64())]
     Timeout(Duration),
@@ -33,16 +36,16 @@ pub enum ErrorKind {
         expected: String,
         unexpected: Vec<KValue>,
     },
-    #[error("insufficient arguments - expected {expected}, found {actual}")]
+    #[error("insufficient arguments ({actual}, expected {expected})")]
     InsufficientArguments { expected: u8, actual: u8 },
-    #[error("too many arguments - expected {expected}, found {actual}")]
+    #[error("too many arguments ({actual}, expected {expected})")]
     TooManyArguments { expected: u8, actual: u8 },
-    #[error("unexpected type - expected: '{expected}', found: '{}'", unexpected.type_as_string())]
+    #[error("expected {expected}, found {}", unexpected.type_as_string())]
     UnexpectedType {
         expected: String,
         unexpected: KValue,
     },
-    #[error("unexpected object type - expected: '{expected}', found: '{unexpected}'")]
+    #[error("expected {expected}, found {unexpected}")]
     UnexpectedObjectType {
         expected: &'static str,
         unexpected: KString,
@@ -58,8 +61,6 @@ pub enum ErrorKind {
         rhs: KValue,
         op: BinaryOp,
     },
-    #[error(transparent)]
-    CompileError(#[from] ModuleLoaderError),
     #[error("empty call stack")]
     EmptyCallStack,
     #[error("missing sequence builder")]
@@ -72,16 +73,21 @@ pub enum ErrorKind {
         "an unexpected error occurred, please report this as a bug at\nhttps://github.com/koto-lang/koto/issues"
     )]
     UnexpectedError,
+
+    #[error(transparent)]
+    CompileError(#[from] ModuleLoaderError),
 }
 
-fn display_thrown_value(value: &KValue, vm: &KotoVm) -> String {
-    let mut display_context = DisplayContext::with_vm(vm);
+fn display_thrown_value(value: &KValue, vm: Option<&KotoVm>) -> String {
+    if let Some(vm) = vm {
+        let mut display_context = DisplayContext::with_vm(vm);
 
-    if value.display(&mut display_context).is_ok() {
-        display_context.result()
-    } else {
-        "Unable to display error message".into()
+        if value.display(&mut display_context).is_ok() {
+            return display_context.result();
+        }
     }
+
+    "Unable to display error message".into()
 }
 
 impl fmt::Debug for ErrorKind {
@@ -95,39 +101,39 @@ impl fmt::Debug for ErrorKind {
 pub struct Error {
     /// The error that was thrown
     pub error: ErrorKind,
+    /// Additional context attached to the error
+    pub context: Vec<String>,
     /// The stack trace at the point when the error was thrown
-    pub trace: Vec<ErrorFrame>,
+    pub trace: Vec<InstructionFrame>,
 }
 
 impl Error {
-    /// Initializes an error with the given internal error type
-    pub(crate) fn new(error: ErrorKind) -> Self {
+    /// Initializes an error with the given [`ErrorKind`]
+    pub fn new(error: ErrorKind) -> Self {
         Self {
             error,
+            context: Vec::new(),
             trace: Vec::new(),
         }
     }
 
-    /// Initializes an error from a thrown Koto value
-    pub(crate) fn from_koto_value(thrown_value: KValue, vm: KotoVm) -> Self {
-        Self::new(ErrorKind::KotoError { thrown_value, vm })
+    /// Initializes an error with the given [`ErrorKind`] and the top frame of the stack trace
+    ///
+    /// This is useful for errors thrown from native functions after they were initially called
+    /// from the runtime, e.g. iterator adaptors that can throw errors when the iterator is being
+    /// lazily consumed; it's helpful to highlight the adaptor itself at the top of the stack trace.
+    pub fn with_error_frame(error: ErrorKind, error_frame: InstructionFrame) -> Self {
+        Self {
+            error,
+            context: Vec::new(),
+            trace: vec![error_frame],
+        }
     }
 
-    /// Extends the error stack with the given [Chunk] and instruction pointer
-    pub(crate) fn extend_trace(&mut self, chunk: Ptr<Chunk>, instruction: u32) {
-        self.trace.push(ErrorFrame { chunk, instruction });
-    }
-
-    /// Modifies string errors to include the given prefix
+    /// Adds additional context to the error
     #[must_use]
-    pub fn with_prefix(mut self, prefix: &str) -> Self {
-        use ErrorKind::StringError;
-
-        self.error = match self.error {
-            StringError(message) => StringError(format!("{prefix}: {message}")),
-            other => other,
-        };
-
+    pub fn with_context(mut self, prefix: String) -> Self {
+        self.context.push(prefix);
         self
     }
 
@@ -138,13 +144,34 @@ impl Error {
             _ => false,
         }
     }
+
+    /// Returns true if the error kind is [`ErrorKind::Unimplemented`]
+    pub fn is_unimplemented_error(&self) -> bool {
+        matches!(&self.error, ErrorKind::Unimplemented { .. })
+    }
+
+    /// Initializes an error from a thrown Koto value
+    pub(crate) fn from_koto_value(thrown_value: KValue) -> Self {
+        Self::new(ErrorKind::KotoError {
+            thrown_value,
+            vm: None, // A vm will be spawned if the error propagates outside of the runtime
+        })
+    }
+
+    /// Extends the error stack with the given [Chunk] and instruction pointer
+    pub(crate) fn extend_trace(&mut self, instruction_frame: InstructionFrame) {
+        self.trace.push(instruction_frame);
+    }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.error)?;
+        for context in self.context.iter() {
+            write!(f, " ({context})")?;
+        }
 
-        for ErrorFrame { chunk, instruction } in self.trace.iter() {
+        for InstructionFrame { chunk, instruction } in self.trace.iter() {
             write!(f, "\n--- ")?;
 
             if let Some(span) = chunk.debug_info.get_source_span(*instruction) {
@@ -194,7 +221,7 @@ where
 /// A chunk and instruction pointer in a call stack where an error was thrown
 #[derive(Clone, Debug)]
 #[allow(missing_docs)]
-pub struct ErrorFrame {
+pub struct InstructionFrame {
     pub chunk: Ptr<Chunk>,
     pub instruction: u32,
 }

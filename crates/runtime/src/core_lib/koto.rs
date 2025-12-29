@@ -14,8 +14,6 @@ use std::{
 pub fn make_module() -> KMap {
     let result = KMap::with_type("core.koto");
 
-    result.insert("args", KValue::Tuple(KTuple::default()));
-
     result.add_fn("copy", |ctx| match ctx.args() {
         [KValue::Iterator(iter)] => Ok(iter.make_copy()?.into()),
         [KValue::List(l)] => Ok(KList::with_data(l.data().clone()).into()),
@@ -34,11 +32,6 @@ pub fn make_module() -> KMap {
     result.add_fn("deep_copy", |ctx| match ctx.args() {
         [value] => value.deep_copy(),
         unexpected => unexpected_args("|Any|", unexpected),
-    });
-
-    result.add_fn("exports", |ctx| match ctx.args() {
-        [] => Ok(KValue::Map(ctx.vm.exports().clone())),
-        unexpected => unexpected_args("||", unexpected),
     });
 
     result.add_fn("hash", |ctx| match ctx.args() {
@@ -83,6 +76,8 @@ pub fn make_module() -> KMap {
         unexpected => unexpected_args("|Any|", unexpected),
     });
 
+    result.insert("unimplemented", KObject::from(Unimplemented));
+
     result.add_fn("load", |ctx| match ctx.args() {
         [KValue::Str(s)] => Ok(try_load_koto_script(ctx, s)?.into()),
         unexpected => unexpected_args("|String|", unexpected),
@@ -115,6 +110,7 @@ fn try_load_koto_script(ctx: &CallContext<'_>, script: &str) -> Result<Chunk> {
 
 /// The Chunk type used in the koto module
 #[derive(Clone, KotoCopy, KotoType)]
+#[koto(runtime = crate)]
 pub struct Chunk(Ptr<koto_bytecode::Chunk>);
 
 impl Chunk {
@@ -123,7 +119,7 @@ impl Chunk {
     }
 }
 
-impl KotoEntries for Chunk {}
+impl KotoAccess for Chunk {}
 
 impl KotoObject for Chunk {
     fn display(&self, ctx: &mut DisplayContext) -> Result<()> {
@@ -147,3 +143,11 @@ impl From<Chunk> for KValue {
         KObject::from(chunk).into()
     }
 }
+
+/// A type error type used in the koto module
+#[derive(Clone, KotoCopy, KotoType)]
+#[koto(runtime = crate)]
+pub struct Unimplemented;
+
+impl KotoAccess for Unimplemented {}
+impl KotoObject for Unimplemented {}

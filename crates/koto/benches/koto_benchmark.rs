@@ -1,5 +1,5 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use koto::Koto;
+use koto::{Ptr, prelude::*};
 use std::{fs::read_to_string, path::PathBuf};
 
 #[global_allocator]
@@ -7,6 +7,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 struct BenchmarkRunner {
     runtime: Koto,
+    chunk: Ptr<Chunk>,
 }
 
 impl BenchmarkRunner {
@@ -19,31 +20,31 @@ impl BenchmarkRunner {
         path.push(script_path);
         let script = read_to_string(path).expect("Unable to load path");
 
-        let mut runtime = Koto::new();
+        let mut runtime =
+            Koto::with_settings(KotoSettings::default().with_args(args.iter().copied()));
+
         let prelude = runtime.prelude();
         prelude.insert("geometry", koto_geometry::make_module());
 
-        match runtime.compile(&script) {
-            Ok(_) => {
-                runtime
-                    .set_args(args.iter().map(|s| s.to_string()))
-                    .unwrap();
-                if let Err(error) = runtime.run() {
+        let chunk = match runtime.compile(&script) {
+            Ok(chunk) => {
+                if let Err(error) = runtime.run(chunk.clone()) {
                     panic!("{error}");
                 }
+                chunk
             }
             Err(error) => panic!("{error}"),
-        }
+        };
 
         // The benchmark tests will be run when first instantiated,
         // and can be skipped on subsequent runs
         runtime.set_run_tests(false);
 
-        Self { runtime }
+        Self { runtime, chunk }
     }
 
     fn run(&mut self) {
-        if let Err(error) = self.runtime.run() {
+        if let Err(error) = self.runtime.run(self.chunk.clone()) {
             panic!("{error}");
         }
     }

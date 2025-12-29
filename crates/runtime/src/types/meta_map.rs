@@ -54,14 +54,18 @@ pub enum MetaKey {
     ///
     /// e.g. `@not`
     UnaryOp(UnaryOp),
+    /// A read operation
+    ///
+    /// e.g. `@access`
+    ReadOp(ReadOp),
+    /// A write operation
+    ///
+    /// e.g. `@access_assign`
+    WriteOp(WriteOp),
     /// Function call - `@call`
     ///
     /// Defines the behaviour when performing a function call on the object.
     Call,
-    /// `@index_mut`
-    ///
-    /// Defines how an object should behave in mutable indexing operations.
-    IndexMut,
     /// A named key
     ///
     /// e.g. `@meta my_named_key`
@@ -119,6 +123,18 @@ impl From<BinaryOp> for MetaKey {
     }
 }
 
+impl From<ReadOp> for MetaKey {
+    fn from(op: ReadOp) -> Self {
+        Self::ReadOp(op)
+    }
+}
+
+impl From<WriteOp> for MetaKey {
+    fn from(op: WriteOp) -> Self {
+        Self::WriteOp(op)
+    }
+}
+
 /// The binary operations that can be implemented in a [MetaMap](crate::MetaMap)
 ///
 /// See [MetaKey::BinaryOp]
@@ -134,6 +150,20 @@ pub enum BinaryOp {
     Divide,
     /// `@%`
     Remainder,
+    /// `@^`
+    Power,
+    /// `@r+`
+    AddRhs,
+    /// `@r-`
+    SubtractRhs,
+    /// `@r*`
+    MultiplyRhs,
+    /// `@r/`
+    DivideRhs,
+    /// `@r%`
+    RemainderRhs,
+    /// `@r^`
+    PowerRhs,
     /// `@+=`
     AddAssign,
     /// `@-=`
@@ -144,6 +174,8 @@ pub enum BinaryOp {
     DivideAssign,
     /// `@%=`
     RemainderAssign,
+    /// `@^=`
+    PowerAssign,
     /// `@<`
     Less,
     /// `@<=`
@@ -156,8 +188,6 @@ pub enum BinaryOp {
     Equal,
     /// `@!=`
     NotEqual,
-    /// `@index`
-    Index,
 }
 
 impl fmt::Display for BinaryOp {
@@ -168,23 +198,76 @@ impl fmt::Display for BinaryOp {
             f,
             "{}",
             match self {
-                Add => "+",
-                Subtract => "-",
-                Multiply => "*",
-                Divide => "/",
-                Remainder => "%",
+                Add | AddRhs => "+",
+                Subtract | SubtractRhs => "-",
+                Multiply | MultiplyRhs => "*",
+                Divide | DivideRhs => "/",
+                Remainder | RemainderRhs => "%",
+                Power | PowerRhs => "^",
                 AddAssign => "+=",
                 SubtractAssign => "-=",
                 MultiplyAssign => "*=",
                 DivideAssign => "/=",
                 RemainderAssign => "%=",
+                PowerAssign => "^=",
                 Less => "<",
                 LessOrEqual => "<=",
                 Greater => ">",
                 GreaterOrEqual => ">=",
                 Equal => "==",
                 NotEqual => "!=",
-                Index => "[]",
+            }
+        )
+    }
+}
+
+/// The read operations that can be implemented in a [MetaMap](crate::MetaMap)
+///
+/// See [MetaKey::ReadOp]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ReadOp {
+    /// `@index`
+    Index,
+    /// `@access`
+    Access,
+}
+
+impl fmt::Display for ReadOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                ReadOp::Index => "[]",
+                ReadOp::Access => ".",
+            }
+        )
+    }
+}
+
+/// The write operations that can be implemented in a [MetaMap](crate::MetaMap)
+///
+/// See [MetaKey::WriteOp]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum WriteOp {
+    /// `@index_assign`
+    ///
+    /// Defines how an object should behave in mutable indexing operations.
+    IndexAssign,
+    /// `@access_assign`
+    ///
+    /// Defines how an object should behave in mutable `.` access operations.
+    AccessAssign,
+}
+
+impl fmt::Display for WriteOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                WriteOp::IndexAssign => "[]",
+                WriteOp::AccessAssign => ".",
             }
         )
     }
@@ -213,28 +296,37 @@ pub enum UnaryOp {
 
 /// Converts a [MetaKeyId](koto_parser::MetaKeyId) into a [MetaKey]
 pub fn meta_id_to_key(id: MetaKeyId, name: Option<KString>) -> Result<MetaKey> {
-    use BinaryOp::*;
-    use UnaryOp::*;
+    use {BinaryOp::*, ReadOp::*, UnaryOp::*, WriteOp::*};
 
     let result = match id {
+        MetaKeyId::Index => MetaKey::ReadOp(Index),
+        MetaKeyId::Access => MetaKey::ReadOp(Access),
+        MetaKeyId::IndexAssign => MetaKey::WriteOp(IndexAssign),
+        MetaKeyId::AccessAssign => MetaKey::WriteOp(AccessAssign),
         MetaKeyId::Add => MetaKey::BinaryOp(Add),
         MetaKeyId::Subtract => MetaKey::BinaryOp(Subtract),
         MetaKeyId::Multiply => MetaKey::BinaryOp(Multiply),
         MetaKeyId::Divide => MetaKey::BinaryOp(Divide),
         MetaKeyId::Remainder => MetaKey::BinaryOp(Remainder),
+        MetaKeyId::Power => MetaKey::BinaryOp(Power),
+        MetaKeyId::AddRhs => MetaKey::BinaryOp(AddRhs),
+        MetaKeyId::SubtractRhs => MetaKey::BinaryOp(SubtractRhs),
+        MetaKeyId::MultiplyRhs => MetaKey::BinaryOp(MultiplyRhs),
+        MetaKeyId::DivideRhs => MetaKey::BinaryOp(DivideRhs),
+        MetaKeyId::RemainderRhs => MetaKey::BinaryOp(RemainderRhs),
+        MetaKeyId::PowerRhs => MetaKey::BinaryOp(PowerRhs),
         MetaKeyId::AddAssign => MetaKey::BinaryOp(AddAssign),
         MetaKeyId::SubtractAssign => MetaKey::BinaryOp(SubtractAssign),
         MetaKeyId::MultiplyAssign => MetaKey::BinaryOp(MultiplyAssign),
         MetaKeyId::DivideAssign => MetaKey::BinaryOp(DivideAssign),
         MetaKeyId::RemainderAssign => MetaKey::BinaryOp(RemainderAssign),
+        MetaKeyId::PowerAssign => MetaKey::BinaryOp(PowerAssign),
         MetaKeyId::Less => MetaKey::BinaryOp(Less),
         MetaKeyId::LessOrEqual => MetaKey::BinaryOp(LessOrEqual),
         MetaKeyId::Greater => MetaKey::BinaryOp(Greater),
         MetaKeyId::GreaterOrEqual => MetaKey::BinaryOp(GreaterOrEqual),
         MetaKeyId::Equal => MetaKey::BinaryOp(Equal),
         MetaKeyId::NotEqual => MetaKey::BinaryOp(NotEqual),
-        MetaKeyId::Index => MetaKey::BinaryOp(Index),
-        MetaKeyId::IndexMut => MetaKey::IndexMut,
         MetaKeyId::Iterator => MetaKey::UnaryOp(Iterator),
         MetaKeyId::Next => MetaKey::UnaryOp(Next),
         MetaKeyId::NextBack => MetaKey::UnaryOp(NextBack),

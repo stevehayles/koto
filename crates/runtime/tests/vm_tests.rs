@@ -45,8 +45,8 @@ mod vm {
         }
 
         #[test]
-        fn subtract_divide_remainder() {
-            check_script_output("(20 - 2) / 3 % 4", 2);
+        fn subtract_divide_remainder_power() {
+            check_script_output("(20 - 2) / 3 % 2 ^ 2", 2); // ((20 - 2) / 3) % (2 ^ 2)
         }
 
         #[test]
@@ -65,6 +65,46 @@ a = 99
         #[test]
         fn remainder_with_a_divisor_of_zero() {
             check_script_output("(1 % 0).is_nan()", true);
+        }
+
+        #[test]
+        fn power_negative() {
+            check_script_output("2 ^ -1", 0.5);
+        }
+
+        mod integer_wrapping {
+            use super::*;
+
+            #[test]
+            fn addition() {
+                check_script_output("2 ^ 62 + 2 ^ 62", i64::MIN);
+            }
+
+            #[test]
+            fn subtraction() {
+                // 2 ^ 63 wraps to i64::MIN
+                check_script_output("2 ^ 63 - 1", i64::MAX);
+            }
+
+            #[test]
+            fn negate() {
+                check_script_output("-(2 ^ 63)", i64::MIN);
+            }
+
+            #[test]
+            fn multiply() {
+                check_script_output("2 ^ 62 * 2", i64::MIN);
+            }
+
+            #[test]
+            fn power() {
+                check_script_output("2 ^ 64", 0);
+            }
+
+            #[test]
+            fn remainder() {
+                check_script_output("(2 ^ 63) % -1", 0);
+            }
         }
     }
 
@@ -194,6 +234,13 @@ a, b, c
             check_script_output("10..=20", KRange::from(10..=20));
             check_script_output("4..=0", KRange::from(4..=0));
             check_script_output("2 * 2..=3 * 3", KRange::from(4..=9));
+        }
+
+        #[test]
+        fn range_indexing() {
+            check_script_output("(10..=20)[5]", 15);
+            check_script_output("(100..)[100]", 200);
+            check_script_output("(-10..-20)[3]", -13);
         }
     }
 
@@ -440,8 +487,11 @@ l2[1]";
 
         #[test]
         fn assign_single_value() {
-            let script = "a, b = 42";
-            check_script_output(script, tuple(&[42.into(), KValue::Null]));
+            let script = "
+result = a, b = 42
+a, b, result
+";
+            check_script_output(script, tuple(&[42.into(), KValue::Null, 42.into()]));
         }
 
         #[test]
@@ -459,22 +509,39 @@ a";
         }
 
         #[test]
+        fn assign_tuple_propagate() {
+            let script = "
+result = a, b = 1, 2
+a, b, result
+";
+            check_script_output(script, tuple(&[1.into(), 2.into(), number_tuple(&[1, 2])]));
+        }
+
+        #[test]
         fn list_elements_2_to_2() {
             let script = "
 x = [0, 0]
-x[0], x[1] = -1, 42";
+x[0], x[1] = -1, 42
+x[0], x[1]
+";
             check_script_output(script, number_tuple(&[-1, 42]));
         }
 
         #[test]
         fn unpack_list() {
-            let script = "a, b, c = [7, 8]";
+            let script = "
+a, b, c = [7, 8]
+a, b, c
+";
             check_script_output(script, tuple(&[7.into(), 8.into(), KValue::Null]));
         }
 
         #[test]
         fn multiple_lists() {
-            let script = "a, b, c = [1, 2], [3, 4]";
+            let script = "
+a, b, c = [1, 2], [3, 4]
+a, b, c
+";
             check_script_output(
                 script,
                 tuple(&[number_list(&[1, 2]), number_list(&[3, 4]), KValue::Null]),
@@ -483,7 +550,10 @@ x[0], x[1] = -1, 42";
 
         #[test]
         fn iterator() {
-            let script = "a, b, c = (1, 2).each |x| x * 10";
+            let script = "
+a, b, c = (1, 2).each |x| x * 10
+a, b, c
+";
             check_script_output(script, tuple(&[10.into(), 20.into(), KValue::Null]));
         }
 
@@ -491,7 +561,9 @@ x[0], x[1] = -1, 42";
         fn iterator_into_chains() {
             let script = "
 x = [1, 2]
-x[0], x[1] = (1, 2).each |x| x * 10";
+x[0], x[1] = (1, 2).each |x| x * 10
+x[0], x[1]
+";
             check_script_output(script, tuple(&[10.into(), 20.into()]));
         }
 
@@ -532,6 +604,128 @@ c
 ";
             check_script_output(script, KValue::Null);
         }
+
+        #[test]
+        fn propagate_rhs_iterator() {
+            let script = "
+i = (1..10).iter()
+c, d = a, b = i
+a, b, c, d
+";
+            check_script_output(script, number_tuple(&[1, 2, 3, 4]));
+        }
+
+        #[test]
+        fn same_local_in_result_and_element_temp() {
+            let script = "
+a, b, c = 1, 2, 3
+b = a, b, c = a, b, c
+b
+";
+            check_script_output(script, number_tuple(&[1, 2, 3]));
+        }
+
+        #[test]
+        fn same_local_in_result_and_element_list() {
+            let script = "
+a, b, c = 1, 2, 3
+b = a, b, c = [a, b, c]
+b
+";
+            check_script_output(script, number_list(&[1, 2, 3]));
+        }
+    }
+
+    mod map_unpacking {
+        use super::*;
+
+        #[test]
+        fn simple() {
+            let script = "
+{x} = {x: 1}
+x
+";
+            check_script_output(script, 1);
+        }
+
+        #[test]
+        fn rebind_id_to_id() {
+            let script = "
+{x as y} = {x: 1}
+y
+";
+            check_script_output(script, 1);
+        }
+
+        #[test]
+        fn rebind_id_to_ignore() {
+            let script = "
+x = 'unchanged'
+{x as _} = {x: 1}
+x
+";
+            check_script_output(script, "unchanged");
+        }
+
+        #[test]
+        fn rebind_string_to_id() {
+            let script = "
+{'x' as y} = {x: 1}
+y
+";
+            check_script_output(script, 1);
+        }
+
+        #[test]
+        fn rebind_string_to_ignore() {
+            let script = "
+x = 'unchanged'
+{x as _} = {x: 1}
+x
+";
+            check_script_output(script, "unchanged");
+        }
+
+        #[test]
+        fn result_value() {
+            let script = "
+{x} = {x: 1}
+";
+
+            let map = KMap::new();
+            map.insert("x", 1);
+            check_script_output(script, map);
+        }
+
+        #[test]
+        fn same_local_in_result_and_key() {
+            let script = "
+x = {x} = {x: 1}
+x
+";
+            let map = KMap::new();
+            map.insert("x", 1);
+            check_script_output(script, map);
+        }
+
+        #[test]
+        fn propagate_rhs() {
+            let script = "
+result = {x} = {y} = {x: 1, y: 2, z: 3}
+x, y, result
+";
+
+            check_script_output(
+                script,
+                tuple(&[1.into(), 2.into(), {
+                    let map = KMap::new();
+                    map.insert("x", 1);
+                    map.insert("y", 2);
+                    map.insert("z", 3);
+                    map.into()
+                }]),
+            );
+        }
     }
 
     mod type_checks {
@@ -565,7 +759,7 @@ x, y, z
         }
 
         #[test]
-        fn multi_assignment_with_wildcard() {
+        fn multi_assignment_with_ignored_value() {
             let script = "
 let x: String, _: String = 'foo', 'bar'
 x
@@ -574,7 +768,7 @@ x
         }
 
         #[test]
-        fn multi_assignment_with_tagged_wildcard() {
+        fn multi_assignment_with_tagged_ignored_value() {
             let script = "
 let x: String, _y: String = 'foo', 'bar'
 x
@@ -613,6 +807,33 @@ true
         fn iterable_matches_iterable_values() {
             let script = "
 let x: Iterable, y: Iterable = 1..10, 'foo'
+true
+";
+            check_script_output(script, true);
+        }
+
+        #[test]
+        fn unpacked_map_with_type() {
+            let script = "
+let {}: Foo = {@type: 'Foo'}
+true
+";
+            check_script_output(script, true);
+        }
+
+        #[test]
+        fn unpacked_map_with_checked_key() {
+            let script = "
+let {x: Number} = {x: 1}
+true
+";
+            check_script_output(script, true);
+        }
+
+        #[test]
+        fn unpacked_map_with_checked_key_and_type() {
+            let script = "
+let {x: Number}: Foo = {x: 1, @type: 'Foo'}
 true
 ";
             check_script_output(script, true);
@@ -887,7 +1108,7 @@ match 'hello!'
         }
 
         #[test]
-        fn match_on_multiple_expressions_with_alternatives_wildcard() {
+        fn match_ignored_on_multiple_expressions_with_alternatives() {
             let script = "
 match 0, 1
   0, 0 or 1, 1 then -1
@@ -900,7 +1121,7 @@ match 0, 1
         }
 
         #[test]
-        fn match_on_multiple_expressions_with_alternatives_id() {
+        fn match_id_on_multiple_expressions_with_alternatives() {
             let script = "
 match 0, 1
   0, 0 or 1, 1 then -1
@@ -1024,6 +1245,57 @@ x = match 99
 x
 "#;
             check_script_output(script, 100);
+        }
+
+        #[test]
+        fn match_map() {
+            let script = "
+match {bar: 2}
+  {foo} then 'err'
+  {bar} then 'ok'
+";
+            check_script_output(script, "ok");
+        }
+
+        #[test]
+        fn match_map_with_type() {
+            let script = "
+match { @type: 'Foo', x: 3}
+  {x}: Bar then 'bar'
+  {x}: Foo then 'foo'
+  else 'neither'
+";
+            check_script_output(script, "foo");
+        }
+
+        #[test]
+        fn match_map_with_element_type() {
+            let script = "
+match {foo: 'bar'}
+  {foo: Number} then 'err'
+  {foo: String} then 'ok'
+";
+            check_script_output(script, "ok");
+        }
+
+        #[test]
+        fn match_map_or_first() {
+            let script = "
+match {x: 1}
+  {z} or {w} then 'err'
+  {x} or {y} then 'ok'
+";
+            check_script_output(script, "ok");
+        }
+
+        #[test]
+        fn match_map_or_last() {
+            let script = "
+match {y: 1}
+  {z} or {w} then 'err'
+  {x} or {y} then 'ok'
+";
+            check_script_output(script, "ok");
         }
     }
 
@@ -1187,16 +1459,16 @@ add 2, add 3, 4";
         }
 
         #[test]
-        fn nested_call_in_parens() {
+        fn nested_call_with_parens() {
             let script = "
 add = |a, b|
   a + b
-add(5, add 6, 7)";
+add(5, add(6, 7))";
             check_script_output(script, 18);
         }
 
         #[test]
-        fn wildcard_arg_at_start() {
+        fn ignored_arg_at_start() {
             let script = "
 f = |_, b, c| b + c
 f 1, 2, 3
@@ -1205,7 +1477,7 @@ f 1, 2, 3
         }
 
         #[test]
-        fn wildcard_arg_in_middle() {
+        fn ignored_arg_in_middle() {
             let script = "
 f = |a, _, c| a + c
 f 1, 2, 3
@@ -1214,7 +1486,7 @@ f 1, 2, 3
         }
 
         #[test]
-        fn wildcard_arg_at_end() {
+        fn ignored_arg_at_end() {
             let script = "
 f = |a, b, _| a + b
 f 1, 2, 3
@@ -1238,7 +1510,7 @@ f 1, (2, 3), 4
             fn nested() {
                 let script = "
 f = |a, (_, (c, d), _), f| a + c + d + f
-f 1, (2, (3, 4), 5), 6
+f 1, (2, 3..=4, 5), 6
 ";
                 check_script_output(script, 14);
             }
@@ -1326,12 +1598,96 @@ f (1, 2)
             }
 
             #[test]
+            fn ellipsis_at_start_with_inclusive_range() {
+                let script = "
+f = |(..., y, z)| y, z
+f 0..=100
+";
+                check_script_output(script, number_tuple(&[99, 100]));
+            }
+
+            #[test]
+            fn ellipsis_at_start_with_non_inclusive_range() {
+                let script = "
+f = |(..., y, z)| y, z
+f 0..100
+";
+                check_script_output(script, number_tuple(&[98, 99]));
+            }
+
+            #[test]
+            fn ellipsis_at_start_with_inclusive_descending_range() {
+                let script = "
+f = |(..., y, z)| y, z
+f -10..=-20
+";
+                check_script_output(script, number_tuple(&[-19, -20]));
+            }
+
+            #[test]
+            fn ellipsis_at_start_with_non_inclusive_descending_range() {
+                let script = "
+f = |(..., y, z)| y, z
+f 50..10
+";
+                check_script_output(script, number_tuple(&[12, 11]));
+            }
+
+            #[test]
+            fn ellipsis_at_end_with_range() {
+                let script = "
+f = |(a, b, ...)| a, b
+f 0..=100
+";
+                check_script_output(script, number_tuple(&[0, 1]));
+            }
+
+            #[test]
+            fn ellipsis_at_end_with_descending_range() {
+                let script = "
+f = |(a, b, ...)| a, b
+f -10..-20
+";
+                check_script_output(script, number_tuple(&[-10, -11]));
+            }
+
+            #[test]
             fn unpacking_a_map() {
                 let script = "
 f = |((_, a), (_, b))| a + b
 f {foo: 42, bar: 99}
 ";
                 check_script_output(script, 141);
+            }
+
+            #[test]
+            fn unpacking_map_by_keys() {
+                let script = "
+f = |{x, y}|
+    x + y
+f {x: 1, y: 2}
+";
+                check_script_output(script, 3);
+            }
+
+            #[test]
+            fn unpacking_map_with_type_by_keys() {
+                let script = "
+f = |{x, y}: Foo|
+  x + y
+f {x: 1, y: 2, @type: 'Foo'}
+";
+                check_script_output(script, 3);
+            }
+
+            #[test]
+            fn unpacking_map_by_keys_with_type() {
+                let script = "
+f = |{x: Number}|
+  x
+f {x: 3}
+";
+                check_script_output(script, 3);
             }
 
             #[test]
@@ -1388,7 +1744,7 @@ f 42";
                 let script = "
 f = |a, b, c...|
   a + b + c.fold 0, |x, y| x + y
-f (f 5, 10, 20, 30), 40, 50";
+f f(5, 10, 20, 30), 40, 50";
                 check_script_output(script, 155);
             }
 
@@ -1442,9 +1798,9 @@ f x..., 'c', y...
 f = |args...| args
 x = (1, 2)
 y = (3, 4)
-5 -> f x..., y...
+0 -> f x..., y...
 ";
-                check_script_output(script, number_tuple(&[1, 2, 3, 4, 5]));
+                check_script_output(script, number_tuple(&[0, 1, 2, 3, 4]));
             }
 
             #[test]
@@ -1468,6 +1824,17 @@ f []..., (1, 2, 3, 4)...
 ";
                 check_script_output(script, number_tuple(&[1, 2, 3, 4]));
             }
+
+            #[test]
+            fn in_parentheses() {
+                let script = "
+f = |a, b, c, d| a, b, c, d
+x = 1, 2
+y = 3, 4
+f(x..., y...)
+";
+                check_script_output(script, number_tuple(&[1, 2, 3, 4]));
+            }
         }
 
         #[test]
@@ -1484,7 +1851,7 @@ add 10, 20";
         fn nested_calls() {
             let script = "
 add = |a, b| a + b
-add 10, (add 20, 30)";
+add 10, add(20, 30)";
             check_script_output(script, 60);
         }
 
@@ -1510,7 +1877,7 @@ fib = |n|
   else if n == 1
     1
   else
-    (fib n - 1) + (fib n - 2)
+    fib(n - 1) + fib(n - 2)
 fib 4
 ";
             check_script_output(script, 3);
@@ -1522,7 +1889,7 @@ fib 4
 f, g =
   (|n| if n == 0 then 1 else f n - 1),
   (|n| if n == 0 then 2 else g n - 1)
-(f 4), (g 4)
+f(4), g(4)
 ";
             check_script_output(script, number_tuple(&[1, 2]));
         }
@@ -1788,13 +2155,14 @@ f == g, f != g
             fn chained_piping() {
                 let script = "
 add = |a, b| a + b
-multiply = |a, b| a * b
 square = |x| x * x
-add 1, 2
-  -> square
-  -> multiply 10
+pow = |a, b| a ^ b
+
+add 1, 2    # 3
+  -> square # 9
+  -> pow 2  # 81
 ";
-                check_script_output(script, 90);
+                check_script_output(script, 81);
             }
 
             #[test]
@@ -1829,6 +2197,31 @@ get_op = |i| ops[i]
   -> get_op(1)  # 2
 ";
                 check_script_output(script, 2);
+            }
+
+            #[test]
+            fn with_core_lib_functions() {
+                let script = "
+'1x2x3'
+  -> string.split 'x'
+  -> iterator.to_string
+  -> string.repeat 2
+";
+                check_script_output(script, "123123");
+            }
+
+            #[test]
+            fn with_optional_argument() {
+                let script = "
+repeat = |input, n = 3| input.repeat n
+
+'O'
+  -> repeat
+  -> repeat 2
+
+# 3 * 2 repeats
+";
+                check_script_output(script, "OOOOOO");
             }
 
             #[test]
@@ -1987,6 +2380,16 @@ for a, _foo, b in ((1, 99, 2), (3, 99, 4))
   sum += a + b
 ";
             check_script_output(script, 10);
+        }
+
+        #[test]
+        fn for_map_arg() {
+            let script = "
+sum = 0
+for {x} in [{x: 1}, {x: 2}, {x: 3}]
+    sum += x
+";
+            check_script_output(script, 6);
         }
 
         #[test]
@@ -2370,6 +2773,42 @@ m[0]
 ";
             check_script_output(script, tuple(&["foo".into(), 42.into()]));
         }
+
+        #[test]
+        fn display_map_without_type() {
+            let script = "
+foo =
+    val: 2
+
+'{foo} - {foo:?}' # Check that @type is not shown
+";
+            check_script_output(script, "{val: 2} - {val: 2}");
+        }
+
+        #[test]
+        fn display_map_with_type() {
+            let script = "
+foo =
+    @type: 'Foo'
+    val: 2
+
+'{foo} - {foo:?}' # Check that @type is shown
+";
+            check_script_output(script, "Foo {val: 2} - Foo {val: 2}");
+        }
+
+        #[test]
+        fn display_map_with_type_and_overriden_display() {
+            let script = "
+foo =
+    @display: || 'display'
+    @type: 'Foo'
+    val: 2
+
+'{foo} - {foo:?}' # Check that @type is shown
+";
+            check_script_output(script, "display - display");
+        }
     }
 
     mod chains {
@@ -2456,6 +2895,14 @@ m =
 m.foo 1, 2, 3
 ";
             check_script_output(script, 6);
+        }
+
+        #[test]
+        fn functions_in_braced_map() {
+            let script = "
+m = {square: |x| x ^ 2, cube: |x| x ^ 3}
+m.square(2) + m.cube(2)";
+            check_script_output(script, 12);
         }
 
         #[test]
@@ -2602,6 +3049,28 @@ foo [42]
         }
 
         #[test]
+        fn default_arg_is_list() {
+            let script = "
+foo = |a, b = []| b.push a
+foo 1
+foo 2
+";
+            check_script_output(script, number_list(&[1, 2]));
+        }
+
+        #[test]
+        fn default_arg_is_named_list() {
+            let script = "
+z = [10, 20]
+foo = |a, b = z| b.push a
+foo 30
+foo 40
+z
+";
+            check_script_output(script, number_list(&[10, 20, 30, 40]));
+        }
+
+        #[test]
         fn default_arg_with_capture() {
             let script = "
 x = 100
@@ -2642,6 +3111,34 @@ foo([42, 99]).to_tuple()
         }
 
         #[test]
+        fn default_for_unpacked_arg() {
+            let script = "
+foo = |a = 10, (b, c) = (20, 30)|
+  a + b + c
+foo(100)
+";
+            check_script_output(script, 150);
+        }
+
+        #[test]
+        fn default_for_ignored_arg() {
+            let script = "
+m = { default_call_made: false }
+
+f = ||
+  m.default_call_made = true
+  20
+
+foo = |a = 10, _b = f(), c = 30|
+  a + c
+
+assert m.default_call_made
+foo(1, 2)
+";
+            check_script_output(script, 31);
+        }
+
+        #[test]
         fn if_else_used_in_map_block() {
             let script = "
 foo =
@@ -2664,11 +3161,23 @@ f()(8)
             check_script_output(script, 64);
         }
 
+        #[test]
+        fn index_assign_in_if_condition() {
+            let script = "
+x = [0]
+if (x[0] += 1) == 0
+  1
+else
+  99
+";
+            check_script_output(script, 99);
+        }
+
         mod optional_chaining {
             use super::*;
 
             #[test]
-            fn check_after_lookup() {
+            fn failed_check_after_lookup() {
                 let script = "
 m = {foo: null}
 x = m.foo?.nested
@@ -2678,7 +3187,7 @@ x
             }
 
             #[test]
-            fn check_after_previous_assignment() {
+            fn failed_check_after_previous_assignment() {
                 let script = "
 m = {foo: null}
 x = 99
@@ -2689,7 +3198,7 @@ x
             }
 
             #[test]
-            fn checks_between_calls() {
+            fn failed_checks_between_calls() {
                 let script = "
 f = || null
 x = f()?()
@@ -2699,7 +3208,7 @@ x
             }
 
             #[test]
-            fn check_before_assignment() {
+            fn failed_check_before_assignment() {
                 let script = "
 m = {foo: null}
 m.foo? = 1
@@ -2709,7 +3218,7 @@ m.foo
             }
 
             #[test]
-            fn check_before_compound_assignment() {
+            fn successful_check_before_compound_assignment() {
                 let script = "
 m = {foo: 42}
 m.foo? += 1
@@ -2719,7 +3228,7 @@ m.foo
             }
 
             #[test]
-            fn several_checks_pass() {
+            fn several_successful_checks() {
                 let script = "
 m = || {foo: [{bar: {baz: 99}}]}
 m?()?.foo?[0]?.bar?.baz? += 1
@@ -2737,7 +3246,7 @@ m?()?.foo?[0]?.bar?.get('baz')? += 1
             }
 
             #[test]
-            fn check_into_piped_call_pass() {
+            fn successful_check_on_rhs_of_piped_access() {
                 let script = "
 m = {foo: |x| x}
 42 -> m.foo?
@@ -2746,7 +3255,7 @@ m = {foo: |x| x}
             }
 
             #[test]
-            fn check_into_piped_call_after_call_pass() {
+            fn successful_check_on_rhs_of_piped_call() {
                 let script = "
 m = {foo: || |x| x}
 42 -> m.foo()?
@@ -2764,7 +3273,7 @@ m = {foo: null}
             }
 
             #[test]
-            fn check_before_piped_call_pass() {
+            fn successful_check_before_piped_call() {
                 let script = "
 f = |x|
   x = x or 0
@@ -2776,7 +3285,7 @@ m.foo?() -> f
             }
 
             #[test]
-            fn check_short_circuited_before_piped_call() {
+            fn failed_check_short_circuits_before_piped_call() {
                 let script = "
 f = |x|
   x = x or 0
@@ -2788,7 +3297,7 @@ m.foo?() -> f
             }
 
             #[test]
-            fn check_after_call() {
+            fn successful_check_after_call() {
                 let script = "
 m = {foo: || 42}
 m.foo()? # The check is redundant, but shouldn't error
@@ -2797,7 +3306,7 @@ m.foo()? # The check is redundant, but shouldn't error
             }
 
             #[test]
-            fn check_when_result_is_temporary() {
+            fn failed_check_when_result_is_temporary() {
                 // The result should be 0 due to `m` not containing a value for `bar`
                 // If the temporary register used by the match expression isn't cleared correctly,
                 // then the `other` arm will be matched instead of the `null` arm.
@@ -3365,6 +3874,19 @@ catch error
         }
 
         #[test]
+        fn try_catch_with_unpacked_map() {
+            let script = r#"
+try
+  throw
+    x: 10
+    y: 20
+catch {x, y}
+  x + y
+"#;
+            check_script_output(script, 30);
+        }
+
+        #[test]
         fn try_catch_finally() {
             let script = "
 try
@@ -3378,7 +3900,43 @@ finally
         }
 
         #[test]
-        fn try_catch_with_type_checks() {
+        fn try_catch_type_check_bool() {
+            let script = "
+x = 1
+try
+  x += 1
+  throw true
+catch error: Bool
+  error
+catch _error: Number
+  throw 'Caught number'
+catch error: String
+  throw 'Caught string'
+catch error
+  throw 'Fallback'
+";
+            check_script_output(script, true);
+        }
+
+        #[test]
+        fn try_catch_type_check_on_unpacked_map() {
+            let script = "
+try
+  throw
+    @type: 'Foo'
+    data: 99
+catch {data}: Bar
+  'Bar: {data}'
+catch {data}: Foo
+  'Foo: {data}'
+catch error
+  throw 'Fallback'
+";
+            check_script_output(script, "Foo: 99");
+        }
+
+        #[test]
+        fn try_catch_type_check_string() {
             let script = "
 x = 1
 try
@@ -3438,16 +3996,28 @@ catch _
 locals = {}
 foo = |x| {x}.with_meta locals.foo_meta
 locals.foo_meta =
+  @type: 'Foo'
   @+: |other| foo self.x + other.x
   @-: |other| foo self.x - other.x
   @*: |other| foo self.x * other.x
   @/: |other| foo self.x / other.x
   @%: |other| foo self.x % other.x
+  @r+: |other| foo other + self.x
+  @r-: |other| foo other - self.x
+  @r*: |other| foo other * self.x
+  @r/: |other| foo other / self.x
+  @r%: |other| foo other % self.x
 
-z = ((foo 2) * (foo 10) / (foo 4) + (foo 1) - (foo 2)) % foo 3
+
+y = foo 2
+z = ((2 + y) + y) # (4) 6
+    * (2 * y)     # (12) 24
+    / (4 / y)     # (2) 12
+    % (5 % y)     # (2) 0
+    - (5 - y)     # (3) -3
 z.x
 ";
-            check_script_output(script, 1);
+            check_script_output(script, -3);
         }
 
         #[test]
@@ -3746,12 +4316,12 @@ x[1] + x[2]
         }
 
         #[test]
-        fn index_mut() {
+        fn index_assign() {
             let script = "
 x =
   data: [1, 2, 3]
   @index: |i| self.data[i]
-  @index_mut: |i, x| self.data[i] = x
+  @index_assign: |i, x| self.data[i] = x
 x[1] = 99
 x[2] = 1
 x[1] + x[2]
@@ -3760,11 +4330,11 @@ x[1] + x[2]
         }
 
         #[test]
-        fn index_mut_result_is_rhs() {
+        fn index_assign_result_is_rhs() {
             let script = "
 x =
-  @index_mut: |_i, _x|
-    -1 # The result of @index_mut should be discarded
+  @index_assign: |_i, _x|
+    -1 # The result of @index_assign should be discarded
 x[1] = 99
 ";
             check_script_output(script, 99);
@@ -3813,6 +4383,76 @@ match foo (10, 11, 12, 13)
     a + b + c + size others
 ";
             check_script_output(script, 34);
+        }
+    }
+
+    mod overridden_access {
+        use super::*;
+
+        #[test]
+        fn access_multiple() {
+            let script = "
+foo =
+  @access: |key| match key
+    'x' then 123
+    'y' then 77
+
+foo.x + foo.y
+";
+            check_script_output(script, 200);
+        }
+
+        #[test]
+        fn access_missing() {
+            let script = "
+foo =
+  z: 42
+  @access: |key| match key
+    'x' then 123
+
+foo.z
+";
+            check_script_output(script, KValue::Null);
+        }
+
+        #[test]
+        fn access_no_meta_fallback() {
+            let script = "
+foo =
+  @access: |key| match key
+    'x' then 123
+  @meta bar: 'bar'
+
+foo.bar
+";
+            check_script_output(script, KValue::Null);
+        }
+
+        #[test]
+        fn access_assign() {
+            let script = "
+foo =
+  @access_assign: |key, value|
+    map.insert self, key, value * 10
+
+assigned_value = foo.x = 10
+foo.x + assigned_value
+";
+            check_script_output(script, 110);
+        }
+
+        #[test]
+        fn access_modify_assign() {
+            let script = "
+foo =
+  @access_assign: |key, value|
+    map.insert self, key, value * 10
+
+foo.x = 1
+foo.x += 2 # (10 + 2) * 10
+foo.x
+";
+            check_script_output(script, 120);
         }
     }
 
@@ -4001,6 +4641,53 @@ from number import 'pi' as 𝜋
 number.pi == 𝜋";
             check_script_output(script, true);
         }
+
+        #[test]
+        fn wildcard_import_at_top_level() {
+            let script = "
+from number import *
+abs -42
+";
+            check_script_output(script, 42);
+        }
+
+        #[test]
+        fn wildcard_import_inside_function() {
+            let script = "
+from string import *
+
+f = |x|
+  from number import *
+  g = |x| abs x
+  repeat '{g x}', 2
+
+f -50
+";
+            check_script_output(script, "5050");
+        }
+
+        #[test]
+        fn wildcard_import_precedence() {
+            let script = "
+foo = { a: 1, b: 2, c: 3}
+bar = { a: -1, b: -2 }
+
+from foo import *
+from bar import *
+
+b * c
+";
+            check_script_output(script, -6);
+        }
+
+        #[test]
+        fn wildcard_import_with_assignment() {
+            let script = "
+foo = from number import *
+foo.abs -42
+";
+            check_script_output(script, 42);
+        }
     }
 
     mod export {
@@ -4044,7 +4731,7 @@ x + y";
         }
 
         #[test]
-        fn map_export() {
+        fn map_literal() {
             let script = "
 export
   x: 1
@@ -4052,6 +4739,27 @@ export
 x + y
 ";
             check_script_output(script, 3);
+        }
+
+        #[test]
+        fn map_variable() {
+            let script = "
+m =
+  x: 1
+  y: 2
+export m
+x + y
+";
+            check_script_output(script, 3);
+        }
+
+        #[test]
+        fn iterator() {
+            let script = "
+export (1..=3).each |i| 'generated_{i}', i
+generated_1 + generated_2 + generated_3
+";
+            check_script_output(script, 6);
         }
 
         #[test]

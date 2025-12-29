@@ -30,6 +30,12 @@ struct Frame {
     // non-local accesses.
     pending_accesses: HashSet<ConstantIndex>,
     pending_assignments: HashSet<ConstantIndex>,
+
+    // If this is still `Some` after the expression is done parsing
+    // then this error will be returned.
+    // This is used when we parse `MapKeyRebind` nodes
+    // which are only allowed on the left hand side of an assignment.
+    error_if_not_lhs: Option<(SyntaxError, Span)>,
 }
 
 impl Frame {
@@ -73,6 +79,18 @@ impl Frame {
         self.ids_assigned_in_frame
             .extend(self.pending_assignments.drain());
     }
+
+    // Register an error, that will be returned after the expression has been parsed.
+    fn register_error_if_not_lhs(&mut self, error: SyntaxError, span: Span) {
+        if self.error_if_not_lhs.is_none() {
+            self.error_if_not_lhs = Some((error, span));
+        }
+    }
+
+    // Clears the error that has been registered.
+    fn clear_error_if_not_lhs(&mut self) {
+        self.error_if_not_lhs = None;
+    }
 }
 
 // The set of rules that can modify how an expression is parsed
@@ -115,6 +133,8 @@ struct ExpressionContext {
     //      ^~~ The first line in an indented block will have the flag set to true to allow the
     //          block to be parsed as a map, see parse_indented_block().
     allow_map_block: bool,
+    // True when at the top-level inside braces, e.g. inside a tuple, list, or braced map
+    inside_braces: bool,
     // The indentation rules for the current context
     expected_indentation: Indentation,
     // When true, map entries should be exported, with the keys assigned to local variables.
@@ -145,6 +165,7 @@ impl ExpressionContext {
             allow_space_separated_call: false,
             allow_linebreaks: false,
             allow_map_block: false,
+            inside_braces: false,
             expected_indentation: Indentation::Greater,
             export_map_entries: false,
         }
@@ -174,25 +195,15 @@ impl ExpressionContext {
         }
     }
 
-    // At the start of a braced expression
-    // e.g.
-    //   x = [f x, y] # A single entry list is created with the result of calling `f(x, y)`
-    fn braced_items_start() -> Self {
+    // Inside a braced expression
+    //
+    // - Space separated calls are only allowed with a single argument
+    // - Inline function bodies can't return paren-free tuples
+    fn inside_braces() -> Self {
         Self {
             expected_indentation: Indentation::Flexible,
+            inside_braces: true,
             ..Self::permissive()
-        }
-    }
-
-    // After the first item in a braced expression
-    // Space-separated calls aren't allowed after the first entry,
-    // otherwise confusing expressions like the following would be accepted:
-    //   x = [1, 2, foo 3, 4, 5]
-    //   # This would be parsed as [1, 2, foo(3, 4, 5)]
-    fn braced_items_continued() -> Self {
-        Self {
-            allow_space_separated_call: false,
-            ..Self::braced_items_start()
         }
     }
 
@@ -233,6 +244,27 @@ impl ExpressionContext {
     }
 }
 
+/// Options that are passed into [`Parser::parse`]
+pub struct ParserOptions {
+    /// Whether or not string escape codes should be processed. (default: `true`)
+    ///
+    /// When true, escape codes will be processed, with the processed string stored in the constant
+    /// pool. When false, the string contents will be stored in the constant pool exactly as defined
+    /// in the source file.
+    ///
+    /// The runtime expects this to be `true`, while some development tools like `koto_format` will
+    /// set this to `false`.
+    pub process_escape_codes: bool,
+}
+
+impl Default for ParserOptions {
+    fn default() -> Self {
+        Self {
+            process_escape_codes: true,
+        }
+    }
+}
+
 /// Koto's parser
 pub struct Parser<'source> {
     source: &'source str,
@@ -240,13 +272,18 @@ pub struct Parser<'source> {
     constants: ConstantPoolBuilder,
     lexer: Lexer<'source>,
     current_token: LexedToken,
-    current_line: u32,
     frame_stack: Vec<Frame>,
+    options: ParserOptions,
 }
 
 impl<'source> Parser<'source> {
     /// Takes in a source script, and produces an Ast
     pub fn parse(source: &'source str) -> Result<Ast> {
+        Self::parse_with_options(source, ParserOptions::default())
+    }
+
+    /// Takes in a source script, and produces an Ast
+    pub fn parse_with_options(source: &'source str, options: ParserOptions) -> Result<Ast> {
         let capacity_guess = source.len() / 4;
         let mut parser = Parser {
             source,
@@ -254,14 +291,29 @@ impl<'source> Parser<'source> {
             constants: ConstantPoolBuilder::default(),
             lexer: Lexer::new(source),
             current_token: LexedToken::default(),
-            current_line: 0,
             frame_stack: Vec::new(),
+            options,
         };
 
-        parser.consume_main_block()?;
-        parser.ast.set_constants(parser.constants.build());
-
-        Ok(parser.ast)
+        match parser.consume_main_block() {
+            Ok(_) => {
+                parser.ast.set_constants(parser.constants.build());
+                Ok(parser.ast)
+            }
+            Err(error) => {
+                #[cfg(feature = "error_ast")]
+                {
+                    parser.ast.set_constants(parser.constants.build());
+                    let mut error = error;
+                    error.ast = Some(Box::new(parser.ast));
+                    Err(error)
+                }
+                #[cfg(not(feature = "error_ast"))]
+                {
+                    Err(error)
+                }
+            }
+        }
     }
 
     // Parses the main 'top-level' block
@@ -277,11 +329,19 @@ impl<'source> Parser<'source> {
         while self.peek_token_with_context(&context).is_some() {
             self.consume_until_token_with_context(&context);
 
-            let Some(expression) = self.parse_line(&ExpressionContext::permissive())? else {
-                return self.consume_token_and_error(SyntaxError::ExpectedExpression);
-            };
-
-            body.push(expression);
+            match self.parse_line(&ExpressionContext::permissive()) {
+                Ok(Some(expression)) => {
+                    body.push(expression);
+                }
+                Ok(None) => {
+                    self.push_main_block_node_on_error(body, start_span);
+                    return self.consume_token_and_error(SyntaxError::ExpectedExpression);
+                }
+                Err(error) => {
+                    self.push_main_block_node_on_error(body, start_span);
+                    return Err(error);
+                }
+            }
 
             match self.peek_next_token_on_same_line() {
                 Some(Token::Semicolon) => {
@@ -289,26 +349,51 @@ impl<'source> Parser<'source> {
                 }
                 Some(Token::NewLine) => {}
                 None => break,
-                _ => return self.consume_token_and_error(SyntaxError::UnexpectedToken),
+                _ => {
+                    self.push_main_block_node_on_error(body, start_span);
+                    return self.consume_token_and_error(SyntaxError::UnexpectedToken);
+                }
             }
         }
 
         // Check that all tokens were consumed
         self.consume_until_token_with_context(&ExpressionContext::permissive());
         if self.peek_token().is_some() {
+            self.push_main_block_node_on_error(body, start_span);
             return self.consume_token_and_error(SyntaxError::UnexpectedToken);
         }
 
-        let result = self.push_node_with_start_span(
+        let result = self.push_main_block_node(body, start_span)?;
+
+        self.frame_stack.pop();
+        Ok(result)
+    }
+
+    fn push_main_block_node_on_error(&mut self, mut body: AstVec<AstIndex>, start_span: Span) {
+        if cfg!(feature = "error_ast") {
+            match (body.last(), self.ast.entry_point()) {
+                (Some(last_successful), Some(last_errored)) if *last_successful != last_errored => {
+                    body.push(last_errored)
+                }
+                (None, Some(last_errored)) => body.push(last_errored),
+                _ => {}
+            }
+            self.push_main_block_node(body, start_span).ok();
+        }
+    }
+
+    fn push_main_block_node(
+        &mut self,
+        body: AstVec<AstIndex>,
+        start_span: Span,
+    ) -> Result<AstIndex> {
+        self.push_node_with_start_span(
             Node::MainBlock {
                 body,
                 local_count: self.frame()?.local_count(),
             },
             start_span,
-        )?;
-
-        self.frame_stack.pop();
-        Ok(result)
+        )
     }
 
     // Attempts to parse an indented block after the current position
@@ -320,6 +405,7 @@ impl<'source> Parser<'source> {
     fn parse_indented_block(&mut self) -> Result<Option<AstIndex>> {
         let block_context = ExpressionContext::permissive();
 
+        let start_line = self.current_line();
         let start_indent = self.current_indent();
         match self.peek_token_with_context(&block_context) {
             Some(peeked) if peeked.info.indent > start_indent => {}
@@ -329,22 +415,31 @@ impl<'source> Parser<'source> {
         let block_context = self
             .consume_until_token_with_context(&block_context)
             .unwrap(); // Safe to unwrap here given that we've just peeked
-        let start_span = self.current_span();
+        let start_span = Span::line_start(start_line + 1);
 
-        let mut block = AstVec::new();
+        let mut body = AstVec::new();
         loop {
             let line_context = ExpressionContext {
-                allow_map_block: block.is_empty(),
+                allow_map_block: body.is_empty(),
                 ..ExpressionContext::permissive()
             };
 
-            let Some(expression) = self.parse_line(&line_context)? else {
-                // At this point we've peeked to check that the line is either the start of the
-                // block, or a continuation with the same indentation as the block.
-                return self.consume_token_and_error(SyntaxError::UnexpectedToken);
-            };
-
-            block.push(expression);
+            match self.parse_line(&line_context) {
+                Ok(Some(expression)) => {
+                    // If we've consumed a map block then return it as the indented block
+                    body.push(expression);
+                }
+                Ok(None) => {
+                    // At this point we've peeked to check that the line is either the start of the
+                    // block, or a continuation with the same indentation as the block.
+                    self.push_block_node_on_error(body, start_span);
+                    return self.consume_token_and_error(SyntaxError::UnexpectedToken);
+                }
+                Err(error) => {
+                    self.push_block_node_on_error(body, start_span);
+                    return Err(error);
+                }
+            }
 
             match self.peek_next_token_on_same_line() {
                 None => break,
@@ -352,7 +447,10 @@ impl<'source> Parser<'source> {
                 Some(Token::Semicolon) => {
                     self.consume_next_token_on_same_line();
                 }
-                _ => return self.consume_token_and_error(SyntaxError::UnexpectedToken),
+                _ => {
+                    self.push_block_node_on_error(body, start_span);
+                    return self.consume_token_and_error(SyntaxError::UnexpectedToken);
+                }
             }
 
             // Peek ahead to see if the indented block continues after this line
@@ -363,13 +461,29 @@ impl<'source> Parser<'source> {
             self.consume_until_token_with_context(&block_context);
         }
 
-        // If the block is a single expression then it doesn't need to be wrapped in a Block node
-        if block.len() == 1 {
-            Ok(Some(*block.first().unwrap()))
-        } else {
-            self.push_node_with_start_span(Node::Block(block), start_span)
-                .map(Some)
+        self.push_block_node(body, start_span)
+    }
+
+    fn push_block_node_on_error(&mut self, mut body: AstVec<AstIndex>, start_span: Span) {
+        if cfg!(feature = "error_ast") {
+            match (body.last(), self.ast.entry_point()) {
+                (Some(last_successful), Some(last_errored)) if *last_successful != last_errored => {
+                    body.push(last_errored)
+                }
+                (None, Some(last_errored)) => body.push(last_errored),
+                _ => {}
+            }
+            self.push_block_node(body, start_span).ok();
         }
+    }
+
+    fn push_block_node(
+        &mut self,
+        body: AstVec<AstIndex>,
+        start_span: Span,
+    ) -> Result<Option<AstIndex>> {
+        self.push_node_with_start_span(Node::Block(body), start_span)
+            .map(Some)
     }
 
     // Parses expressions from the start of a line
@@ -394,7 +508,7 @@ impl<'source> Parser<'source> {
             ..*context
         };
 
-        let start_line = self.current_line;
+        let start_line = self.current_line();
 
         let Some(first) = self.parse_expression(&expression_context)? else {
             return Ok(None);
@@ -404,58 +518,71 @@ impl<'source> Parser<'source> {
         let mut encountered_linebreak = false;
         let mut last_token_was_a_comma = false;
 
-        while let Some(Token::Comma) = self.peek_next_token_on_same_line() {
-            self.consume_next_token_on_same_line();
+        // If comma-separated expressions are allowed then parse them now
+        //
+        // When inside braces we don't
+        if !context.inside_braces {
+            while let Some(Token::Comma) = self.peek_next_token_on_same_line() {
+                self.consume_next_token_on_same_line();
 
-            if last_token_was_a_comma {
-                expressions.push(self.push_node(Node::Null)?);
-            }
-
-            last_token_was_a_comma = true;
-
-            if !encountered_linebreak && self.current_line > start_line {
-                // e.g.
-                //   x, y =
-                //     1, # <- We're here,
-                //        #    following values should have at least this level of indentation.
-                //     0,
-                expression_context = expression_context
-                    .with_expected_indentation(Indentation::GreaterOrEqual(self.current_indent()));
-                encountered_linebreak = true;
-            }
-
-            if let Some(next_expression) =
-                self.parse_expression_start(&expressions, 0, &expression_context)?
-            {
-                last_token_was_a_comma = false;
-
-                match self.ast.node(next_expression).node {
-                    Node::Assign { .. } | Node::MultiAssign { .. } => {
-                        // Assignments will have consumed all of the comma-separated expressions
-                        // encountered so far as the LHS of the assignment, so we can exit here.
-                        return Ok(Some(next_expression));
-                    }
-                    _ => {}
+                if last_token_was_a_comma {
+                    expressions.push(self.push_node(Node::Null)?);
                 }
 
-                let next_expression = match self.peek_next_token_on_same_line() {
-                    Some(Token::Range | Token::RangeInclusive) => {
-                        self.consume_range(Some(next_expression), context)?
-                    }
-                    _ => next_expression,
-                };
+                last_token_was_a_comma = true;
 
-                expressions.push(next_expression);
+                if !encountered_linebreak && self.current_line() > start_line {
+                    // e.g.
+                    //   x, y =
+                    //     1, # <- We're here,
+                    //        #    following values should have at least this level of indentation.
+                    //     0,
+                    expression_context = expression_context.with_expected_indentation(
+                        Indentation::GreaterOrEqual(self.current_indent()),
+                    );
+                    encountered_linebreak = true;
+                }
+
+                if let Some(next_expression) =
+                    self.parse_expression_start(&expressions, 0, &expression_context)?
+                {
+                    last_token_was_a_comma = false;
+
+                    match self.ast.node(next_expression).node {
+                        Node::Assign { .. } | Node::MultiAssign { .. } => {
+                            // Assignments will have consumed all of the comma-separated expressions
+                            // encountered so far as the LHS of the assignment, so we can exit here.
+                            return Ok(Some(next_expression));
+                        }
+                        _ => {}
+                    }
+
+                    let next_expression = match self.peek_next_token_on_same_line() {
+                        Some(Token::Range | Token::RangeInclusive) => {
+                            self.consume_range(Some(next_expression), context)?
+                        }
+                        _ => next_expression,
+                    };
+
+                    expressions.push(next_expression);
+                }
             }
         }
 
         self.frame_mut()?.finalize_id_accesses();
 
+        if let Some((error, span)) = self.frame_mut()?.error_if_not_lhs.clone() {
+            return self.error_with_span(error, span);
+        }
+
         if expressions.len() == 1 && !last_token_was_a_comma {
             Ok(Some(first))
         } else {
             let result = match temp_result {
-                TempResult::No => Node::Tuple(expressions),
+                TempResult::No => Node::Tuple {
+                    elements: expressions,
+                    parentheses: false,
+                },
                 TempResult::Yes => Node::TempTuple(expressions),
             };
             Ok(Some(self.push_node(result)?))
@@ -497,7 +624,7 @@ impl<'source> Parser<'source> {
         min_precedence: u8,
         context: &ExpressionContext,
     ) -> Result<Option<AstIndex>> {
-        let entry_line = self.current_line;
+        let entry_line = self.current_line();
 
         // Look ahead to get the indent of the first token in the expression.
         // We need to look ahead here because the term may contain its own indentation,
@@ -511,7 +638,7 @@ impl<'source> Parser<'source> {
         };
         let start_span = *self.ast.span(self.ast.node(expression_start).span);
 
-        let continuation_context = if self.current_line > entry_line {
+        let continuation_context = if self.current_line() > entry_line {
             match context.expected_indentation {
                 Indentation::Equal(indent)
                 | Indentation::GreaterThan(indent)
@@ -553,101 +680,97 @@ impl<'source> Parser<'source> {
         min_precedence: u8,
         context: &ExpressionContext,
     ) -> Result<Option<AstIndex>> {
-        let start_line = self.current_line;
+        let start_line = self.current_line();
         let start_indent = self.current_indent();
 
         if let Some(assignment_expression) =
-            self.parse_assign_expression(expression_start, previous_expressions, context)?
+            self.parse_assign_expression(expression_start, previous_expressions, context, false)?
         {
             return Ok(Some(assignment_expression));
-        } else if let Some(next) = self.peek_token_with_context(context) {
-            if let Some((left_priority, right_priority)) = operator_precedence(next.token) {
-                if left_priority >= min_precedence {
-                    let (op, _) = self.consume_token_with_context(context).unwrap();
+        } else if let Some(next) = self.peek_token_with_context(context)
+            && let Some((left_priority, right_priority)) = operator_precedence(next.token)
+            && left_priority >= min_precedence
+        {
+            let (op, _) = self.consume_token_with_context(context).unwrap();
 
-                    // Move on to the token after the operator
-                    if self.peek_token_with_context(context).is_none() {
-                        return self.error(ExpectedIndentation::RhsExpression);
-                    }
-                    self.consume_until_token_with_context(context).unwrap();
-
-                    let rhs_context = if self.current_line > start_line {
-                        match context.expected_indentation {
-                            Indentation::Equal(indent)
-                            | Indentation::GreaterThan(indent)
-                            | Indentation::GreaterOrEqual(indent) => {
-                                // If the context has a fixed indentation requirement, then allow
-                                // the indentation for the continued expression to grow or stay the
-                                // same.
-                                context
-                                    .with_expected_indentation(Indentation::GreaterOrEqual(indent))
-                            }
-                            Indentation::Greater | Indentation::Flexible => {
-                                // Indentation within an arithmetic expression shouldn't be able to
-                                // continue with decreased indentation.
-                                context.with_expected_indentation(Indentation::GreaterOrEqual(
-                                    start_indent,
-                                ))
-                            }
-                        }
-                    } else {
-                        *context
-                    };
-                    let Some(rhs) =
-                        self.parse_expression_start(&[], right_priority, &rhs_context)?
-                    else {
-                        return self.error(ExpectedIndentation::RhsExpression);
-                    };
-
-                    use Token::*;
-                    let ast_op = match op {
-                        Add => AstBinaryOp::Add,
-                        Subtract => AstBinaryOp::Subtract,
-                        Multiply => AstBinaryOp::Multiply,
-                        Divide => AstBinaryOp::Divide,
-                        Remainder => AstBinaryOp::Remainder,
-
-                        AddAssign => AstBinaryOp::AddAssign,
-                        SubtractAssign => AstBinaryOp::SubtractAssign,
-                        MultiplyAssign => AstBinaryOp::MultiplyAssign,
-                        DivideAssign => AstBinaryOp::DivideAssign,
-                        RemainderAssign => AstBinaryOp::RemainderAssign,
-
-                        Equal => AstBinaryOp::Equal,
-                        NotEqual => AstBinaryOp::NotEqual,
-
-                        Greater => AstBinaryOp::Greater,
-                        GreaterOrEqual => AstBinaryOp::GreaterOrEqual,
-                        Less => AstBinaryOp::Less,
-                        LessOrEqual => AstBinaryOp::LessOrEqual,
-
-                        And => AstBinaryOp::And,
-                        Or => AstBinaryOp::Or,
-
-                        Arrow => AstBinaryOp::Pipe,
-
-                        _ => unreachable!(), // The list of tokens here matches the operators in
-                                             // operator_precedence()
-                    };
-
-                    let op_node = self.push_node_with_start_span(
-                        Node::BinaryOp {
-                            op: ast_op,
-                            lhs: expression_start,
-                            rhs,
-                        },
-                        start_span,
-                    )?;
-
-                    return self.parse_expression_continued(
-                        op_node,
-                        start_span,
-                        &[],
-                        min_precedence,
-                        &rhs_context,
-                    );
-                }
+            // Move on to the token after the operator
+            if self.peek_token_with_context(context).is_none() {
+                return self.error(ExpectedIndentation::RhsExpression);
             }
+            self.consume_until_token_with_context(context).unwrap();
+
+            let rhs_context = if self.current_line() > start_line {
+                match context.expected_indentation {
+                    Indentation::Equal(indent)
+                    | Indentation::GreaterThan(indent)
+                    | Indentation::GreaterOrEqual(indent) => {
+                        // If the context has a fixed indentation requirement, then allow
+                        // the indentation for the continued expression to grow or stay the
+                        // same.
+                        context.with_expected_indentation(Indentation::GreaterOrEqual(indent))
+                    }
+                    Indentation::Greater | Indentation::Flexible => {
+                        // Indentation within an arithmetic expression shouldn't be able to
+                        // continue with decreased indentation.
+                        context.with_expected_indentation(Indentation::GreaterOrEqual(start_indent))
+                    }
+                }
+            } else {
+                *context
+            };
+            let Some(rhs) = self.parse_expression_start(&[], right_priority, &rhs_context)? else {
+                return self.error(ExpectedIndentation::RhsExpression);
+            };
+
+            use Token::*;
+            let ast_op = match op {
+                Add => AstBinaryOp::Add,
+                Subtract => AstBinaryOp::Subtract,
+                Multiply => AstBinaryOp::Multiply,
+                Divide => AstBinaryOp::Divide,
+                Remainder => AstBinaryOp::Remainder,
+                Power => AstBinaryOp::Power,
+
+                AddAssign => AstBinaryOp::AddAssign,
+                SubtractAssign => AstBinaryOp::SubtractAssign,
+                MultiplyAssign => AstBinaryOp::MultiplyAssign,
+                DivideAssign => AstBinaryOp::DivideAssign,
+                RemainderAssign => AstBinaryOp::RemainderAssign,
+                PowerAssign => AstBinaryOp::PowerAssign,
+
+                Equal => AstBinaryOp::Equal,
+                NotEqual => AstBinaryOp::NotEqual,
+
+                Greater => AstBinaryOp::Greater,
+                GreaterOrEqual => AstBinaryOp::GreaterOrEqual,
+                Less => AstBinaryOp::Less,
+                LessOrEqual => AstBinaryOp::LessOrEqual,
+
+                And => AstBinaryOp::And,
+                Or => AstBinaryOp::Or,
+
+                Arrow => AstBinaryOp::Pipe,
+
+                _ => unreachable!(), // The list of tokens here matches the operators in
+                                     // operator_precedence()
+            };
+
+            let op_node = self.push_node_with_start_span(
+                Node::BinaryOp {
+                    op: ast_op,
+                    lhs: expression_start,
+                    rhs,
+                },
+                start_span,
+            )?;
+
+            return self.parse_expression_continued(
+                op_node,
+                start_span,
+                &[],
+                min_precedence,
+                &rhs_context,
+            );
         }
 
         Ok(Some(expression_start))
@@ -664,6 +787,7 @@ impl<'source> Parser<'source> {
         lhs: AstIndex,
         previous_lhs: &[AstIndex],
         context: &ExpressionContext,
+        let_assignment: bool,
     ) -> Result<Option<AstIndex>> {
         match self
             .peek_token_with_context(context)
@@ -681,7 +805,10 @@ impl<'source> Parser<'source> {
                 Node::Id(id_index, ..) => {
                     self.frame_mut()?.add_local_id_assignment(id_index);
                 }
-                Node::Meta { .. } | Node::Chain(_) | Node::Wildcard(..) => {}
+                Node::Meta { .. } | Node::Chain(_) | Node::Ignored(..) => {}
+                Node::Map { entries, .. } | Node::MapPattern { entries, .. } => {
+                    self.add_local_ids_for_map_assignment(&entries)?
+                }
                 _ => return self.error(SyntaxError::ExpectedAssignmentTarget),
             }
 
@@ -692,9 +819,10 @@ impl<'source> Parser<'source> {
             return self.error(InternalError::MissingAssignmentTarget);
         }
 
+        self.frame_mut()?.clear_error_if_not_lhs();
+
         // Consume the `=` token
         self.consume_token_with_context(context);
-        let assign_span = self.current_span();
 
         let single_target = targets.len() == 1;
 
@@ -705,28 +833,66 @@ impl<'source> Parser<'source> {
         };
 
         if let Some(rhs) = self.parse_expressions(context, temp_result)? {
+            let start_span = self.node_span(*targets.first().unwrap());
             let node = if single_target {
                 Node::Assign {
                     target: *targets.first().unwrap(),
                     expression: rhs,
+                    let_assignment,
                 }
             } else {
                 Node::MultiAssign {
                     targets,
                     expression: rhs,
+                    let_assignment,
                 }
             };
-            Ok(Some(self.push_node_with_span(node, assign_span)?))
+            Ok(Some(self.push_node_with_start_span(node, start_span)?))
         } else {
             self.error(ExpectedIndentation::AssignmentExpression)
         }
+    }
+
+    fn add_local_ids_for_map_assignment(&mut self, entries: &[AstIndex]) -> Result<()> {
+        for &entry in entries {
+            match self.ast.node(entry).node {
+                Node::Id(id, _) => {
+                    self.frame_mut()?.add_local_id_assignment(id);
+                }
+                Node::MapKeyRebind { id_or_ignored, .. } => {
+                    match self.ast.node(id_or_ignored).node.clone() {
+                        Node::Id(id, _) => {
+                            self.frame_mut()?.add_local_id_assignment(id);
+                        }
+                        Node::Ignored(..) => (),
+                        Node::Map { entries, .. } | Node::MapPattern { entries, .. } => {
+                            self.add_local_ids_for_map_assignment(&entries)?;
+                        }
+                        _ => {
+                            return self.error_with_span_of(
+                                SyntaxError::ExpectedMapAssignmentEntry,
+                                id_or_ignored,
+                            );
+                        }
+                    }
+                }
+                Node::MapEntry(_, value) => {
+                    return self.error_with_span_of(SyntaxError::UnexpectedMapKeyTypeHint, value);
+                }
+                _ => {
+                    return self.error_with_span_of(SyntaxError::ExpectedMapAssignmentEntry, entry);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     // Peeks the next token and dispatches to the relevant parsing functions
     fn parse_term(&mut self, context: &ExpressionContext) -> Result<Option<AstIndex>> {
         use Node::*;
 
-        let start_span = self.current_span();
+        let start_line = self.current_line();
         let start_indent = self.current_indent();
 
         let Some(peeked) = self.peek_token_with_context(context) else {
@@ -747,7 +913,7 @@ impl<'source> Parser<'source> {
                 self.push_node(BoolFalse)
             }
             Token::RoundOpen => self.consume_tuple(context),
-            Token::Number => self.consume_number(false, context),
+            Token::Number => self.consume_number(false, context, None),
             Token::StringStart { .. } => {
                 let string = self.parse_string(context)?.unwrap();
                 let string_node = self.push_node_with_span(Str(string.string), string.span)?;
@@ -755,7 +921,7 @@ impl<'source> Parser<'source> {
                 if string.context.allow_map_block
                     && self.peek_next_token_on_same_line() == Some(Token::Colon)
                 {
-                    self.consume_map_block(string_node, start_span, &string.context)
+                    self.consume_map_block(string_node, start_line, &string.context)
                 } else {
                     self.check_for_chain_after_node(string_node, &string.context)
                 }
@@ -779,18 +945,18 @@ impl<'source> Parser<'source> {
                         })
                     )
                 {
-                    self.consume_map_block(meta_key, start_span, &meta_context)
+                    self.consume_map_block(meta_key, start_line, &meta_context)
                 } else {
-                    match self.parse_assign_expression(meta_key, &[], &meta_context)? {
-                        Some(result) => self.push_node(Node::Export(result)),
+                    match self.parse_assign_expression(meta_key, &[], &meta_context, false)? {
+                        Some(result) => Ok(result),
                         None => self
                             .consume_token_and_error(SyntaxError::ExpectedAssignmentAfterMetaKey),
                     }
                 }
             }
-            Token::Wildcard => {
-                let maybe_id = self.consume_wildcard(context)?;
-                self.push_node(Node::Wildcard(maybe_id, None))
+            Token::Underscore => {
+                let maybe_id = self.consume_ignored_id(context)?;
+                self.push_node(Node::Ignored(maybe_id, None))
             }
             Token::SquareOpen => self.consume_list(context),
             Token::CurlyOpen => self.consume_map_with_braces(context),
@@ -802,7 +968,8 @@ impl<'source> Parser<'source> {
                 Some(token) if token.is_whitespace_including_newline() => return Ok(None),
                 Some(Token::Number) => {
                     self.consume_token_with_context(context); // Token::Subtract
-                    self.consume_number(true, context)
+                    let start_span = self.current_span();
+                    self.consume_number(true, context, Some(start_span))
                 }
                 Some(_) => {
                     self.consume_token_with_context(context); // Token::Subtract
@@ -819,15 +986,20 @@ impl<'source> Parser<'source> {
             },
             Token::Not => {
                 self.consume_token_with_context(context);
+                let start_span = self.current_span();
+
                 if let Some(expression) = self.parse_expression(&ExpressionContext {
                     allow_space_separated_call: true,
                     expected_indentation: Indentation::Greater,
                     ..*context
                 })? {
-                    self.push_node(Node::UnaryOp {
-                        op: AstUnaryOp::Not,
-                        value: expression,
-                    })
+                    self.push_node_with_start_span(
+                        Node::UnaryOp {
+                            op: AstUnaryOp::Not,
+                            value: expression,
+                        },
+                        start_span,
+                    )
                 } else {
                     self.consume_token_and_error(SyntaxError::ExpectedExpression)
                 }
@@ -835,6 +1007,7 @@ impl<'source> Parser<'source> {
             Token::Yield => {
                 self.consume_token_with_context(context);
                 let start_span = self.current_span();
+
                 if let Some(expression) =
                     self.parse_expressions(&context.start_new_expression(), TempResult::No)?
                 {
@@ -850,9 +1023,10 @@ impl<'source> Parser<'source> {
             Token::Until => self.consume_until_loop(context),
             Token::Break => {
                 self.consume_token_with_context(context);
+                let start_span = self.current_span();
                 let break_value =
                     self.parse_expressions(&context.start_new_expression(), TempResult::No)?;
-                self.push_node(Node::Break(break_value))
+                self.push_node_with_start_span(Node::Break(break_value), start_span)
             }
             Token::Continue => {
                 self.consume_token_with_context(context);
@@ -888,97 +1062,196 @@ impl<'source> Parser<'source> {
     //   f = |x, y| x + y
     //   #   ^ You are here
     fn consume_function(&mut self, context: &ExpressionContext) -> Result<AstIndex> {
+        let mut function_frame = Frame::default();
+        let (args, start_span) = self.consume_function_args(&mut function_frame, context)?;
+        self.frame_stack.push(function_frame);
+
+        let body = match self.parse_indented_block() {
+            Ok(Some(block)) => block,
+            Ok(None) => {
+                // No indented block, so an inline body is expected
+                self.consume_until_next_token_on_same_line();
+                // If the function is being defined inside braces then the inline body should reflect
+                // that, in particular a paren-free comma belongs to the containing braces.
+                // E.g., `[|x| x, |y| y]` should be parsed as:
+                //   `[(|x| x), (|y| y)]`,
+                // and not
+                //   `[|x| (x, |y| y)]`.
+                let body_context = if context.inside_braces {
+                    ExpressionContext::inside_braces()
+                } else {
+                    ExpressionContext::permissive()
+                };
+                if let Some(body) = self.parse_line(&body_context)? {
+                    body
+                } else {
+                    return self.consume_token_and_error(ExpectedIndentation::FunctionBody);
+                }
+            }
+            Err(error) => {
+                if cfg!(feature = "error_ast")
+                    && let Some(block) = self.ast.entry_point()
+                {
+                    self.push_function_node(start_span, args, block).ok();
+                }
+                return Err(error);
+            }
+        };
+
+        self.push_function_node(start_span, args, body)
+    }
+
+    fn consume_function_args(
+        &mut self,
+        function_frame: &mut Frame,
+        context: &ExpressionContext,
+    ) -> Result<(AstIndex, Span)> {
         self.consume_token_with_context(context); // Token::Function
 
-        let span_start = self.current_span().start;
+        let start_span = self.current_span();
 
-        // Parse function's args
+        // Parse the function's args
         let mut arg_nodes = AstVec::new();
-        let mut arg_ids = AstVec::new();
-        let mut is_variadic = false;
+        let mut variadic = false;
         let mut default_value_expected = false;
+        let args_context = ExpressionContext::inside_braces();
 
-        let args_context = ExpressionContext::braced_items_continued();
-        while self.peek_token_with_context(&args_context).is_some() {
+        while let Some(next) = self.peek_token_with_context(&args_context) {
+            if next.token == Token::Function {
+                break;
+            }
+
             self.consume_until_token_with_context(&args_context);
 
-            match self.parse_id_or_wildcard(&args_context)? {
-                Some(IdOrWildcard::Id(constant_index)) => {
-                    arg_ids.push(constant_index);
-                    let arg_span = self.current_span();
+            let Some(peek_info) = self.peek_token_with_context(&args_context) else {
+                break;
+            };
+
+            let arg_span = peek_info.info.span;
+
+            let arg_node = match peek_info.token {
+                Token::Id => {
+                    self.consume_token_with_context(&args_context);
+                    let id = self.add_current_slice_as_string_constant()?;
+                    function_frame.ids_assigned_in_frame.insert(id);
                     let type_hint = self.parse_type_hint(&args_context)?;
-                    let id_node =
-                        self.push_node_with_span(Node::Id(constant_index, type_hint), arg_span)?;
+                    let arg = self.push_node_with_span(Node::Id(id, type_hint), arg_span)?;
 
                     if self.peek_token() == Some(Token::Ellipsis) {
                         if type_hint.is_some() {
                             return self.consume_token_and_error(SyntaxError::UnexpectedToken);
                         }
                         self.consume_token();
-                        is_variadic = true;
-                        arg_nodes.push(id_node);
+                        variadic = true;
+                        arg_nodes.push(arg);
                         // The variadic argument must be last
                         break;
                     }
 
-                    if matches!(
-                        self.peek_token_with_context(&args_context),
-                        Some(PeekInfo {
-                            token: Token::Assign,
-                            ..
-                        })
-                    ) {
-                        self.consume_token_with_context(&args_context); // =
+                    arg
+                }
+                Token::Underscore => {
+                    let maybe_id = self.consume_ignored_id(&args_context)?;
+                    let type_hint = self.parse_type_hint(&args_context)?;
+                    self.push_node_with_span(Node::Ignored(maybe_id, type_hint), arg_span)?
+                }
+                Token::CurlyOpen => {
+                    self.consume_token_with_context(&args_context); // {
 
-                        let Some(default_value) = self.parse_expression(&args_context)? else {
-                            return self.error(ExpectedIndentation::AssignmentExpression);
+                    let mut entries = AstVec::new();
+                    let start_span = self.current_span();
+                    let entry_context = &ExpressionContext::inside_braces();
+
+                    while self.peek_token_with_context(entry_context).is_some() {
+                        self.consume_until_token_with_context(entry_context);
+
+                        let Some(entry) =
+                            self.parse_unpack_map_entry(BindingContext::Function(function_frame))?
+                        else {
+                            break;
                         };
 
-                        arg_nodes.push(self.push_node_with_start_span(
-                            Node::Assign {
-                                target: id_node,
-                                expression: default_value,
-                            },
-                            arg_span,
-                        )?);
+                        entries.push(entry);
 
-                        default_value_expected = true;
-                    } else if default_value_expected {
-                        return self.error(SyntaxError::ExpectedDefaultValue);
-                    } else {
-                        arg_nodes.push(id_node);
+                        if matches!(
+                            self.peek_token_with_context(entry_context),
+                            Some(PeekInfo {
+                                token: Token::Comma,
+                                ..
+                            })
+                        ) {
+                            self.consume_token_with_context(entry_context);
+                        } else {
+                            break;
+                        }
                     }
-                }
-                Some(IdOrWildcard::Wildcard(maybe_id)) => {
-                    let arg_span = self.current_span();
+
+                    self.expect_and_consume_token(
+                        Token::CurlyClose,
+                        SyntaxError::ExpectedMapEnd.into(),
+                        &ExpressionContext::inside_braces(),
+                    )?;
+
+                    let map_span = self.span_with_start(start_span);
                     let type_hint = self.parse_type_hint(&args_context)?;
-                    arg_nodes.push(
-                        self.push_node_with_span(Node::Wildcard(maybe_id, type_hint), arg_span)?,
-                    );
+                    let arg_node = Node::MapPattern { entries, type_hint };
+                    self.push_node_with_span(arg_node, map_span)?
                 }
-                None => match self.peek_token() {
-                    Some(Token::Self_) => {
-                        self.consume_token();
-                        return self.error(SyntaxError::SelfArg);
-                    }
-                    Some(Token::RoundOpen) => {
-                        self.consume_token();
-                        let nested_span_start = self.current_span();
+                Token::Self_ => {
+                    self.consume_token();
+                    return self.error(SyntaxError::SelfArg);
+                }
+                Token::RoundOpen => {
+                    self.consume_token();
+                    let nested_span_start = self.current_span();
 
-                        let tuple_args = self.parse_nested_function_args(&mut arg_ids)?;
-                        self.expect_and_consume_token(
-                            Token::RoundClose,
-                            SyntaxError::ExpectedCloseParen.into(),
-                            &args_context,
-                        )?;
+                    let tuple_args = self.parse_nested_function_args(function_frame)?;
 
-                        arg_nodes.push(self.push_node_with_start_span(
-                            Node::Tuple(tuple_args),
-                            nested_span_start,
-                        )?);
-                    }
-                    _ => break,
-                },
+                    self.expect_and_consume_token(
+                        Token::RoundClose,
+                        SyntaxError::ExpectedCloseParen.into(),
+                        &args_context,
+                    )?;
+
+                    self.push_node_with_start_span(
+                        Node::Tuple {
+                            elements: tuple_args,
+                            parentheses: true,
+                        },
+                        nested_span_start,
+                    )?
+                }
+                _ => break,
+            };
+
+            // Default value?
+            if matches!(
+                self.peek_token_with_context(&args_context),
+                Some(PeekInfo {
+                    token: Token::Assign,
+                    ..
+                })
+            ) {
+                self.consume_token_with_context(&args_context); // =
+
+                let Some(default_value) = self.parse_expression(&args_context)? else {
+                    return self.error(ExpectedIndentation::AssignmentExpression);
+                };
+
+                arg_nodes.push(self.push_node_with_start_span(
+                    Node::Assign {
+                        target: arg_node,
+                        expression: default_value,
+                        let_assignment: false,
+                    },
+                    arg_span,
+                )?);
+
+                default_value_expected = true;
+            } else if default_value_expected {
+                return self.error(SyntaxError::ExpectedDefaultValue);
+            } else {
+                arg_nodes.push(arg_node);
             }
 
             if matches!(
@@ -1009,22 +1282,24 @@ impl<'source> Parser<'source> {
             None
         };
 
-        // Function body
-        let mut function_frame = Frame::default();
-        function_frame.ids_assigned_in_frame.extend(arg_ids.iter());
-        self.frame_stack.push(function_frame);
+        let args_node = self.push_node_with_start_span(
+            Node::FunctionArgs {
+                args: arg_nodes,
+                variadic,
+                output_type,
+            },
+            start_span,
+        )?;
 
-        let body = if let Some(block) = self.parse_indented_block()? {
-            block
-        } else {
-            self.consume_until_next_token_on_same_line();
-            if let Some(body) = self.parse_line(&ExpressionContext::permissive())? {
-                body
-            } else {
-                return self.consume_token_and_error(ExpectedIndentation::FunctionBody);
-            }
-        };
+        Ok((args_node, start_span))
+    }
 
+    fn push_function_node(
+        &mut self,
+        start_span: Span,
+        args: AstIndex,
+        body: AstIndex,
+    ) -> std::result::Result<AstIndex, Error> {
         let function_frame = self
             .frame_stack
             .pop()
@@ -1035,22 +1310,15 @@ impl<'source> Parser<'source> {
 
         let local_count = function_frame.local_count();
 
-        let span_end = self.current_span().end;
-
-        self.ast.push(
+        self.push_node_with_start_span(
             Node::Function(Function {
-                args: arg_nodes,
+                args,
                 local_count,
                 accessed_non_locals: AstVec::from_iter(function_frame.accessed_non_locals),
                 body,
-                is_variadic,
                 is_generator: function_frame.contains_yield,
-                output_type,
             }),
-            Span {
-                start: span_start,
-                end: span_end,
-            },
+            start_span,
         )
     }
 
@@ -1095,67 +1363,26 @@ impl<'source> Parser<'source> {
         })
     }
 
-    // Helper for parse_function() that recursively parses nested function arguments
+    // Helper for consume_function() that recursively parses nested function arguments
     // e.g.
     //   f = |(foo, bar, (x, y))|
     //   #     ^ You are here
     //   #                ^ ...or here
     fn parse_nested_function_args(
         &mut self,
-        arg_ids: &mut AstVec<ConstantIndex>,
+        function_frame: &mut Frame,
     ) -> Result<AstVec<AstIndex>> {
         let mut nested_args = AstVec::new();
+        let arg_context = &ExpressionContext::inside_braces();
 
-        let args_context = ExpressionContext::braced_items_continued();
-        while self.peek_token_with_context(&args_context).is_some() {
-            self.consume_until_token_with_context(&args_context);
-            match self.parse_id_or_wildcard(&args_context)? {
-                Some(IdOrWildcard::Id(constant_index)) => {
-                    if self.constants.get_str(constant_index) == "self" {
-                        return self.error(SyntaxError::SelfArg);
-                    }
+        while self.peek_token_with_context(arg_context).is_some() {
+            self.consume_until_token_with_context(arg_context);
 
-                    let arg_span = self.current_span();
-                    let arg_node = if self.peek_token() == Some(Token::Ellipsis) {
-                        self.consume_token();
-                        Node::PackedId(Some(constant_index))
-                    } else {
-                        Node::Id(constant_index, self.parse_type_hint(&args_context)?)
-                    };
+            let Some(arg) = self.parse_nested_function_arg(function_frame)? else {
+                break;
+            };
 
-                    nested_args.push(self.push_node_with_span(arg_node, arg_span)?);
-                    arg_ids.push(constant_index);
-                }
-                Some(IdOrWildcard::Wildcard(maybe_id)) => {
-                    let arg_span = self.current_span();
-                    let type_hint = self.parse_type_hint(&args_context)?;
-                    nested_args.push(
-                        self.push_node_with_span(Node::Wildcard(maybe_id, type_hint), arg_span)?,
-                    );
-                }
-                None => match self.peek_token() {
-                    Some(Token::RoundOpen) => {
-                        self.consume_token();
-                        let span_start = self.current_span();
-
-                        let tuple_args = self.parse_nested_function_args(arg_ids)?;
-                        if !matches!(
-                            self.consume_token_with_context(&args_context),
-                            Some((Token::RoundClose, _))
-                        ) {
-                            return self.error(SyntaxError::ExpectedCloseParen);
-                        }
-                        nested_args.push(
-                            self.push_node_with_start_span(Node::Tuple(tuple_args), span_start)?,
-                        );
-                    }
-                    Some(Token::Ellipsis) => {
-                        self.consume_token();
-                        nested_args.push(self.push_node(Node::PackedId(None))?);
-                    }
-                    _ => break,
-                },
-            }
+            nested_args.push(arg);
 
             if self.peek_next_token_on_same_line() == Some(Token::Comma) {
                 self.consume_next_token_on_same_line();
@@ -1165,6 +1392,119 @@ impl<'source> Parser<'source> {
         }
 
         Ok(nested_args)
+    }
+
+    fn parse_nested_function_arg(
+        &mut self,
+        function_frame: &mut Frame,
+    ) -> Result<Option<AstIndex>> {
+        let arg_context = &ExpressionContext::inside_braces();
+
+        let Some(peek_info) = self.peek_token_with_context(arg_context) else {
+            return Ok(None);
+        };
+
+        let node = match peek_info.token {
+            Token::Id => {
+                self.consume_token_with_context(arg_context);
+                let id = self.add_current_slice_as_string_constant()?;
+
+                // because self is tokenized as Self_ instead of Id
+                if self.constants.get_str(id) == "self" {
+                    return self.error(SyntaxError::SelfArg);
+                }
+
+                let arg_span = self.current_span();
+                let arg_node = if self.peek_token() == Some(Token::Ellipsis) {
+                    self.consume_token();
+                    Node::PackedId(Some(id))
+                } else {
+                    Node::Id(id, self.parse_type_hint(arg_context)?)
+                };
+                function_frame.ids_assigned_in_frame.insert(id);
+                self.push_node_with_span(arg_node, arg_span)
+            }
+            Token::Underscore => {
+                let maybe_id = self.consume_ignored_id(arg_context)?;
+                let arg_span = self.current_span();
+                let type_hint = self.parse_type_hint(arg_context)?;
+                let arg_node = Node::Ignored(maybe_id, type_hint);
+                self.push_node_with_span(arg_node, arg_span)
+            }
+            Token::CurlyOpen => {
+                self.consume_token_with_context(arg_context); // {
+
+                let mut entries = AstVec::new();
+                let start_span = self.current_span();
+                let entry_context = &ExpressionContext::inside_braces();
+
+                while self.peek_token_with_context(entry_context).is_some() {
+                    self.consume_until_token_with_context(entry_context);
+
+                    let Some(entry) =
+                        self.parse_unpack_map_entry(BindingContext::Function(function_frame))?
+                    else {
+                        break;
+                    };
+
+                    entries.push(entry);
+
+                    if matches!(
+                        self.peek_token_with_context(entry_context),
+                        Some(PeekInfo {
+                            token: Token::Comma,
+                            ..
+                        })
+                    ) {
+                        self.consume_token_with_context(entry_context);
+                    } else {
+                        break;
+                    }
+                }
+
+                self.expect_and_consume_token(
+                    Token::CurlyClose,
+                    SyntaxError::ExpectedMapEnd.into(),
+                    &ExpressionContext::inside_braces(),
+                )?;
+
+                let type_hint = self.parse_type_hint(arg_context)?;
+                let arg_node = Node::MapPattern { entries, type_hint };
+                self.push_node_with_start_span(arg_node, start_span)
+            }
+            Token::RoundOpen => {
+                self.consume_token();
+                let span_start = self.current_span();
+
+                let tuple_args = self.parse_nested_function_args(function_frame)?;
+
+                if !matches!(
+                    self.consume_token_with_context(arg_context),
+                    Some((Token::RoundClose, _))
+                ) {
+                    return self.error(SyntaxError::ExpectedCloseParen);
+                }
+
+                self.push_node_with_start_span(
+                    Node::Tuple {
+                        elements: tuple_args,
+                        parentheses: true,
+                    },
+                    span_start,
+                )
+            }
+            Token::Ellipsis => {
+                self.consume_token();
+                self.push_node(Node::PackedId(None))
+            }
+            Token::Self_ => {
+                self.consume_token();
+                return self.error(SyntaxError::SelfArg);
+            }
+            _ => return Ok(None),
+        }?;
+
+        Ok(Some(node))
     }
 
     // Attempts to parse whitespace-separated call args
@@ -1183,7 +1523,7 @@ impl<'source> Parser<'source> {
                 ..*context
             };
 
-            let mut last_arg_line = self.current_line;
+            let mut last_arg_line = self.current_line();
 
             while let Some(peeked) = self.peek_token_with_context(&arg_context) {
                 let new_line = peeked.info.line() > last_arg_line;
@@ -1214,7 +1554,9 @@ impl<'source> Parser<'source> {
                     break;
                 }
 
-                if self.peek_next_token_on_same_line() == Some(Token::Comma) {
+                if self.peek_next_token_on_same_line() == Some(Token::Comma)
+                    && !context.inside_braces
+                {
                     self.consume_next_token_on_same_line();
                 } else {
                     break;
@@ -1227,7 +1569,7 @@ impl<'source> Parser<'source> {
 
     // Parses a single id
     //
-    // See also: parse_id_or_wildcard(), consume_id_expression()
+    // See also: parse_id_or_ignored(), consume_id_expression()
     fn parse_id(
         &mut self,
         context: &ExpressionContext,
@@ -1244,11 +1586,11 @@ impl<'source> Parser<'source> {
         }
     }
 
-    // Consumes a single `_` wildcard, along with its optional following id
-    fn consume_wildcard(&mut self, context: &ExpressionContext) -> Result<Option<ConstantIndex>> {
+    // Consumes a single `_`-prefixed identifier, along with its optional following id
+    fn consume_ignored_id(&mut self, context: &ExpressionContext) -> Result<Option<ConstantIndex>> {
         if !matches!(
             self.consume_token_with_context(context),
-            Some((Token::Wildcard, _))
+            Some((Token::Underscore, _))
         ) {
             return self.error(InternalError::UnexpectedToken);
         }
@@ -1263,30 +1605,186 @@ impl<'source> Parser<'source> {
         Ok(maybe_id)
     }
 
-    // Parses either an id or a wildcard
+    // Parses either an id or a `_`-prefixed ignored id
     //
     // Used in function arguments, match expressions, etc.
-    fn parse_id_or_wildcard(
-        &mut self,
-        context: &ExpressionContext,
-    ) -> Result<Option<IdOrWildcard>> {
+    fn parse_id_or_ignored(&mut self, context: &ExpressionContext) -> Result<Option<IdOrIgnored>> {
         match self.peek_token_with_context(context) {
             Some(PeekInfo {
                 token: Token::Id, ..
             }) => {
                 self.consume_token_with_context(context);
                 self.add_current_slice_as_string_constant()
-                    .map(|result| Some(IdOrWildcard::Id(result)))
+                    .map(|result| Some(IdOrIgnored::Id(result)))
             }
             Some(PeekInfo {
-                token: Token::Wildcard,
+                token: Token::Underscore,
                 ..
             }) => {
-                let maybe_id = self.consume_wildcard(context)?;
-                Ok(Some(IdOrWildcard::Wildcard(maybe_id)))
+                let maybe_id = self.consume_ignored_id(context)?;
+                Ok(Some(IdOrIgnored::Ignored(maybe_id)))
             }
             _ => Ok(None),
         }
+    }
+
+    /// Parses either:
+    /// - an id
+    /// - a `_`-prefixed ignored id
+    /// - a map unpacking
+    ///
+    /// Used in function arguments, for loop, and let.
+    fn parse_binding(
+        &mut self,
+        context: &ExpressionContext,
+        mut binding_context: BindingContext,
+    ) -> Result<Option<AstIndex>> {
+        let Some(peek_info) = self.peek_token_with_context(context) else {
+            return Ok(None);
+        };
+
+        match peek_info.token {
+            Token::Id => {
+                self.consume_token_with_context(context);
+                let id = self.add_current_slice_as_string_constant()?;
+                binding_context.add_assigned_id(self, id)?;
+                let span = self.current_span();
+                let type_hint = self.parse_type_hint(context)?;
+                self.push_node_with_span(Node::Id(id, type_hint), span)
+            }
+            Token::Underscore => {
+                let maybe_id = self.consume_ignored_id(context)?;
+                let span = self.current_span();
+                let type_hint = self.parse_type_hint(context)?;
+                self.push_node_with_span(Node::Ignored(maybe_id, type_hint), span)
+            }
+            Token::CurlyOpen => {
+                self.consume_token_with_context(context); // {
+
+                let mut entries = AstVec::new();
+                let start_span = self.current_span();
+                let entry_context = &ExpressionContext::inside_braces();
+
+                while self.peek_token_with_context(entry_context).is_some() {
+                    self.consume_until_token_with_context(entry_context);
+
+                    let Some(entry) = self.parse_unpack_map_entry(binding_context.reborrow())?
+                    else {
+                        break;
+                    };
+
+                    entries.push(entry);
+
+                    if matches!(
+                        self.peek_token_with_context(entry_context),
+                        Some(PeekInfo {
+                            token: Token::Comma,
+                            ..
+                        })
+                    ) {
+                        self.consume_token_with_context(entry_context);
+                    } else {
+                        break;
+                    }
+                }
+
+                self.expect_and_consume_token(
+                    Token::CurlyClose,
+                    SyntaxError::ExpectedMapEnd.into(),
+                    &ExpressionContext::inside_braces(),
+                )?;
+
+                let map_span = self.span_with_start(start_span);
+                let type_hint = self.parse_type_hint(context)?;
+
+                self.push_node_with_span(Node::MapPattern { entries, type_hint }, map_span)
+            }
+            _ => return Ok(None),
+        }
+        .map(Some)
+    }
+
+    fn parse_unpack_map_entry(
+        &mut self,
+        mut binding_context: BindingContext,
+    ) -> Result<Option<AstIndex>> {
+        if let Some(Token::CurlyClose) = self.peek_token() {
+            return Ok(None);
+        }
+
+        let context = &ExpressionContext::inside_braces();
+
+        let allow_as;
+        let require_as;
+        let id_for_assignment;
+
+        let key = if let Some((id, _)) = self.parse_id(context)? {
+            let span = self.current_span();
+            let type_hint = self.parse_type_hint(context)?;
+
+            allow_as = type_hint.is_none();
+            require_as = false;
+            id_for_assignment = Some(id);
+
+            self.push_node_with_span(Node::Id(id, type_hint), span)?
+        } else if let Some(s) = self.parse_string(context)? {
+            allow_as = true;
+            require_as = true;
+            id_for_assignment = None;
+
+            self.push_node_with_span(Node::Str(s.string), s.span)?
+        } else {
+            return self.consume_token_and_error(SyntaxError::ExpectedMapPatKey);
+        };
+
+        if allow_as {
+            if let Some(Token::As) = self.peek_next_token_on_same_line() {
+                self.consume_next_token_on_same_line(); // as
+                self.consume_until_token_with_context(context);
+                return self.consume_map_key_rebind(key, binding_context).map(Some);
+            }
+
+            if require_as {
+                return self.error_with_span_of(SyntaxError::ExpectedMapPatAsAfterString, key);
+            }
+        }
+
+        if let Some(id) = id_for_assignment {
+            binding_context.add_assigned_id(self, id)?;
+        }
+
+        Ok(Some(key))
+    }
+
+    fn consume_map_key_rebind(
+        &mut self,
+        key: AstIndex,
+        mut binding_context: BindingContext,
+    ) -> Result<AstIndex> {
+        let context = &ExpressionContext::inside_braces();
+
+        let Some(id_or_ignored) = self.parse_id_or_ignored(context)? else {
+            return self.consume_token_and_error(SyntaxError::ExpectedUnpackedMapKeyRebindId);
+        };
+
+        let id_or_ignored_span = self.current_span();
+        let type_hint = self.parse_type_hint(context)?;
+
+        if let IdOrIgnored::Id(id) = id_or_ignored {
+            binding_context.add_assigned_id(self, id)?;
+        }
+
+        let id_or_ignored_node = match id_or_ignored {
+            IdOrIgnored::Id(id) => Node::Id(id, type_hint),
+            IdOrIgnored::Ignored(maybe_id) => Node::Ignored(maybe_id, type_hint),
+        };
+
+        let id_or_ignored = self.push_node_with_span(id_or_ignored_node, id_or_ignored_span)?;
+
+        self.push_node_with_start_span(
+            Node::MapKeyRebind { key, id_or_ignored },
+            *self.ast.span(self.ast.node(key).span),
+        )
     }
 
     fn parse_id_or_string(&mut self, context: &ExpressionContext) -> Result<Option<AstIndex>> {
@@ -1302,6 +1800,7 @@ impl<'source> Parser<'source> {
     }
 
     fn consume_id_expression(&mut self, context: &ExpressionContext) -> Result<AstIndex> {
+        let start_line = self.current_line();
         let Some((constant_index, id_context)) = self.parse_id(context)? else {
             return self.consume_token_and_error(InternalError::UnexpectedToken);
         };
@@ -1315,7 +1814,7 @@ impl<'source> Parser<'source> {
             if context.export_map_entries {
                 self.frame_mut()?.add_local_id_assignment(constant_index);
             }
-            self.consume_map_block(id_node, id_span, &id_context)
+            self.consume_map_block(id_node, start_line, &id_context)
         } else {
             self.frame_mut()?.add_id_access(constant_index);
 
@@ -1342,7 +1841,7 @@ impl<'source> Parser<'source> {
                         )),
                         id_span,
                     )?;
-                    self.push_node_with_span(
+                    self.push_node_with_start_span(
                         Node::Chain((ChainNode::Root(id_node), Some(call_node))),
                         id_span,
                     )
@@ -1419,11 +1918,13 @@ impl<'source> Parser<'source> {
     //   y = x[0][1].foo()
     //   #    ^ You are here
     fn consume_chain(&mut self, root: AstIndex, context: &ExpressionContext) -> Result<AstIndex> {
+        let chain_start_span = *self.ast.span(root);
+
         let mut chain = AstVec::new();
-        let mut chain_line = self.current_line;
+        let mut chain_line = chain_start_span.end.line;
 
         let mut node_context = *context;
-        let mut node_start_span = self.current_span();
+        let mut node_start_span = chain_start_span;
         let restricted = ExpressionContext::restricted();
 
         chain.push((ChainNode::Root(root), node_start_span));
@@ -1499,7 +2000,7 @@ impl<'source> Parser<'source> {
                             .unwrap();
 
                         // Check that the next dot is on an indented line
-                        if self.current_line == chain_line {
+                        if self.current_line() == chain_line {
                             return self.consume_token_and_error(SyntaxError::ExpectedMapKey);
                         }
 
@@ -1549,19 +2050,25 @@ impl<'source> Parser<'source> {
                         }
                     }
 
-                    chain_line = self.current_line;
+                    chain_line = self.current_line();
                 }
             }
         }
 
         // Add the chain nodes to the AST in reverse order:
-        // the final AST index will be the chain root node.
+        // the final AST index will be the chain's root node.
         let mut next_index = None;
-        for (node, span) in chain.iter().rev() {
+        for (node, span) in chain.iter().rev().take(chain.len() - 1) {
             next_index =
                 Some(self.push_node_with_span(Node::Chain((node.clone(), next_index)), *span)?);
         }
-        next_index.ok_or_else(|| self.make_error(InternalError::ChainParseFailure))
+        if next_index.is_none() {
+            return self.error(InternalError::ChainParseFailure);
+        }
+        self.push_node_with_start_span(
+            Node::Chain((ChainNode::Root(root), next_index)),
+            chain_start_span,
+        )
     }
 
     // Helper for consume_chain() that parses an index expression
@@ -1652,8 +2159,19 @@ impl<'source> Parser<'source> {
                 .consume_until_token_with_context(&args_context)
                 .unwrap();
 
-            if let Some(expression) = self.parse_expression(&ExpressionContext::inline())? {
-                args.push(expression);
+            let arg_start_span = self.current_span();
+            if let Some(expression) = self.parse_expression(&ExpressionContext::inside_braces())? {
+                let arg_expression = if self.peek_token() == Some(Token::Ellipsis) {
+                    self.consume_token();
+                    self.push_node_with_start_span(
+                        Node::PackedExpression(expression),
+                        arg_start_span,
+                    )?
+                } else {
+                    expression
+                };
+
+                args.push(arg_expression);
             } else {
                 break;
             }
@@ -1773,10 +2291,14 @@ impl<'source> Parser<'source> {
         )
     }
 
-    fn consume_number(&mut self, negate: bool, context: &ExpressionContext) -> Result<AstIndex> {
-        use Node::*;
-
+    fn consume_number(
+        &mut self,
+        negate: bool,
+        context: &ExpressionContext,
+        start_span: Option<Span>,
+    ) -> Result<AstIndex> {
         self.consume_token_with_context(context); // Token::Number
+        let start_span = start_span.unwrap_or_else(|| self.current_span());
 
         let slice = self.current_token.slice(self.source);
         // Strip underscores if necessary
@@ -1797,14 +2319,20 @@ impl<'source> Parser<'source> {
         };
 
         let number_node = if let Ok(n) = maybe_integer {
+            if matches!(self.peek_token_n(0), Some(Token::Dot))
+                && matches!(self.peek_token_n(1), Some(Token::Number))
+            {
+                return self.consume_token_and_error(SyntaxError::NonDecimalFloatsAreUnsupported);
+            }
+
             // Should we store the number as a SmallInt or as a stored constant?
             if u8::try_from(n).is_ok() {
                 let n = if negate { -n } else { n };
-                SmallInt(n as i16)
+                Node::SmallInt(n as i16)
             } else {
                 let n = if negate { -n } else { n };
                 if let Ok(constant_index) = self.constants.add_i64(n) {
-                    Int(constant_index)
+                    Node::Int(constant_index)
                 } else {
                     return self.error(InternalError::ConstantPoolCapacityOverflow);
                 }
@@ -1812,7 +2340,7 @@ impl<'source> Parser<'source> {
         } else if let Ok(n) = f64::from_str(&slice) {
             let n = if negate { -n } else { n };
             if let Ok(constant_index) = self.constants.add_f64(n) {
-                Float(constant_index)
+                Node::Float(constant_index)
             } else {
                 return self.error(InternalError::ConstantPoolCapacityOverflow);
             }
@@ -1820,7 +2348,7 @@ impl<'source> Parser<'source> {
             return self.error(InternalError::NumberParseFailure);
         };
 
-        let node = self.push_node(number_node)?;
+        let node = self.push_node_with_start_span(number_node, start_span)?;
         self.check_for_chain_after_node(node, context)
     }
 
@@ -1843,14 +2371,20 @@ impl<'source> Parser<'source> {
         self.expect_and_consume_token(
             Token::RoundClose,
             SyntaxError::ExpectedCloseParen.into(),
-            &ExpressionContext::braced_items_continued(),
+            &ExpressionContext::inside_braces(),
         )?;
 
         let expressions_node = match entries.as_slice() {
             [single_expression] if !last_token_was_a_comma => {
                 self.push_node_with_start_span(Node::Nested(*single_expression), start_span)?
             }
-            _ => self.push_node_with_start_span(Node::Tuple(entries), start_span)?,
+            _ => self.push_node_with_start_span(
+                Node::Tuple {
+                    elements: entries,
+                    parentheses: true,
+                },
+                start_span,
+            )?,
         };
 
         self.check_for_chain_after_node(
@@ -1870,7 +2404,7 @@ impl<'source> Parser<'source> {
         self.expect_and_consume_token(
             Token::SquareClose,
             SyntaxError::ExpectedListEnd.into(),
-            &ExpressionContext::braced_items_continued(),
+            &ExpressionContext::inside_braces(),
         )?;
 
         let list_node = self.push_node_with_start_span(Node::List(entries), start_span)?;
@@ -1890,7 +2424,7 @@ impl<'source> Parser<'source> {
         end_token: Token,
     ) -> Result<(AstVec<AstIndex>, bool)> {
         let mut entries = AstVec::new();
-        let mut entry_context = ExpressionContext::braced_items_start();
+        let entry_context = ExpressionContext::inside_braces();
         let mut last_token_was_a_comma = false;
 
         while matches!(
@@ -1918,8 +2452,6 @@ impl<'source> Parser<'source> {
                 }
 
                 last_token_was_a_comma = true;
-
-                entry_context = ExpressionContext::braced_items_continued();
             } else {
                 break;
             }
@@ -1931,27 +2463,35 @@ impl<'source> Parser<'source> {
     fn consume_map_block(
         &mut self,
         first_key: AstIndex,
-        start_span: Span,
+        start_line: u32, // The line that was current before the first key was consumed
         context: &ExpressionContext,
     ) -> Result<AstIndex> {
         if !context.allow_map_block {
             return self.error(SyntaxError::ExpectedLineBreakBeforeMapBlock);
         }
 
+        let start_span = Span::line_start((start_line + 1).min(self.current_line()));
         let start_indent = self.current_indent();
 
         if self.consume_next_token_on_same_line() != Some(Token::Colon) {
             return self.error(InternalError::ExpectedMapColon);
         }
 
-        let mut entries = astvec![(first_key, Some(self.consume_map_block_value()?))];
+        let first_value = self.consume_map_block_value()?;
+        let first_entry =
+            self.push_node_with_start_span(Node::MapEntry(first_key, first_value), start_span)?;
+        let mut entries = astvec![first_entry];
 
         let block_context = ExpressionContext::permissive()
             .with_expected_indentation(Indentation::Equal(start_indent));
 
         while self.peek_token_with_context(&block_context).is_some() {
-            self.consume_until_token_with_context(&block_context);
-
+            if self
+                .consume_until_token_with_context(&block_context)
+                .is_none()
+            {
+                return self.consume_token_and_error(SyntaxError::ExpectedMapEntry);
+            };
             let Some(key) = self.parse_map_key(context.export_map_entries)? else {
                 return self.consume_token_and_error(SyntaxError::ExpectedMapEntry);
             };
@@ -1962,10 +2502,19 @@ impl<'source> Parser<'source> {
 
             self.consume_next_token_on_same_line(); // ':'
 
-            entries.push((key, Some(self.consume_map_block_value()?)));
+            let start_span = self.node_span(key);
+            let value = self.consume_map_block_value()?;
+            let entry = self.push_node_with_start_span(Node::MapEntry(key, value), start_span)?;
+            entries.push(entry);
         }
 
-        self.push_node_with_start_span(Node::Map(entries), start_span)
+        self.push_node_with_start_span(
+            Node::Map {
+                entries,
+                braces: false,
+            },
+            start_span,
+        )
     }
 
     fn consume_map_block_value(&mut self) -> Result<AstIndex> {
@@ -1985,13 +2534,21 @@ impl<'source> Parser<'source> {
         let start_span = self.current_span();
 
         let entries = self.parse_comma_separated_map_entries(context)?;
+
         self.expect_and_consume_token(
             Token::CurlyClose,
             SyntaxError::ExpectedMapEnd.into(),
-            &ExpressionContext::braced_items_continued(),
+            &ExpressionContext::inside_braces(),
         )?;
 
-        let map_node = self.push_node_with_start_span(Node::Map(entries), start_span)?;
+        let map_node = self.push_node_with_start_span(
+            Node::Map {
+                entries,
+                braces: true,
+            },
+            start_span,
+        )?;
+
         self.check_for_chain_after_node(
             map_node,
             &context.with_expected_indentation(Indentation::GreaterThan(start_indent)),
@@ -2001,52 +2558,130 @@ impl<'source> Parser<'source> {
     fn parse_comma_separated_map_entries(
         &mut self,
         context: &ExpressionContext,
-    ) -> Result<AstVec<(AstIndex, Option<AstIndex>)>> {
+    ) -> Result<AstVec<AstIndex>> {
         let mut entries = AstVec::new();
-        let mut entry_context = ExpressionContext::braced_items_start();
+        let entry_context = &ExpressionContext::inside_braces();
 
-        while self.peek_token_with_context(&entry_context).is_some() {
-            self.consume_until_token_with_context(&entry_context);
+        while self.peek_token_with_context(entry_context).is_some() {
+            self.consume_until_token_with_context(entry_context);
 
-            let Some(key) = self.parse_map_key(context.export_map_entries)? else {
+            let Some(entry) = self.parse_comma_separated_map_entry(context.export_map_entries)?
+            else {
                 break;
             };
 
-            if self.peek_next_token_on_same_line() == Some(Token::Colon) {
-                self.consume_next_token_on_same_line();
-
-                let value_context = ExpressionContext::permissive();
-                if self.peek_token_with_context(&value_context).is_none() {
-                    return self.error(SyntaxError::ExpectedMapValue);
-                }
-                self.consume_until_token_with_context(&value_context);
-
-                if let Some(value) = self.parse_expression(&value_context)? {
-                    entries.push((key, Some(value)));
-                } else {
-                    return self.consume_token_and_error(SyntaxError::ExpectedMapValue);
-                }
-            } else {
-                // Valueless map entries are allowed in inline maps,
-                // e.g.
-                //   bar = -1
-                //   x = {foo: 42, bar, baz: 99}
-                match self.ast.node(key).node {
-                    Node::Id(id, ..) => self.frame_mut()?.add_id_access(id),
-                    _ => return self.error(SyntaxError::ExpectedMapValue),
-                }
-                entries.push((key, None));
-            }
+            entries.push(entry);
 
             if matches!(
-                self.peek_token_with_context(&entry_context),
+                self.peek_token_with_context(entry_context),
                 Some(PeekInfo {
                     token: Token::Comma,
                     ..
                 })
             ) {
-                self.consume_token_with_context(&entry_context);
-                entry_context = ExpressionContext::braced_items_continued();
+                self.consume_token_with_context(entry_context);
+            } else {
+                break;
+            }
+        }
+
+        Ok(entries)
+    }
+
+    fn parse_comma_separated_map_entry(
+        &mut self,
+        export_map_entries: bool,
+    ) -> Result<Option<AstIndex>> {
+        let entry_context = &ExpressionContext::inside_braces();
+
+        let Some(start_span) = self.peek_span() else {
+            return Ok(None);
+        };
+
+        let mut key = if let Some((id, _)) = self.parse_id(&ExpressionContext::restricted())? {
+            Some(self.push_node(Node::Id(id, None))?)
+        } else if let Some(s) = self.parse_string(&ExpressionContext::restricted())? {
+            Some(self.push_node_with_span(Node::Str(s.string), s.span)?)
+        } else {
+            // The key may be a meta key, but we'll only try to parse them if
+            // we fail to parse the entry as a lhs entry, since meta keys are not valid for lhs.
+            None
+        };
+
+        if let Some(key) = key {
+            // Try to parse this entry as a key rebind
+            if let Some((Token::As, as_span)) = self.peek_next_token_on_same_line_with_span() {
+                self.consume_next_token_on_same_line(); // as
+
+                self.frame_mut()?
+                    .register_error_if_not_lhs(SyntaxError::UnexpectedMapKeyRebindOnRhs, as_span);
+
+                self.consume_until_token_with_context(entry_context);
+
+                let entry = self.consume_map_key_rebind(key, BindingContext::Default)?;
+
+                return Ok(Some(entry));
+            } else if let Node::Id(id, _) = self.ast.node(key).node
+                && export_map_entries
+            {
+                self.frame_mut()?.add_local_id_assignment(id);
+            }
+        } else {
+            key = self.parse_meta_key()?;
+        }
+
+        let Some(key) = key else { return Ok(None) };
+
+        if self.peek_next_token_on_same_line() == Some(Token::Colon) {
+            self.consume_next_token_on_same_line();
+
+            if self.peek_token_with_context(entry_context).is_none() {
+                return self.error(SyntaxError::ExpectedMapValue);
+            }
+
+            self.consume_until_token_with_context(entry_context);
+
+            if let Some(value) = self.parse_expression(entry_context)? {
+                self.push_node_with_start_span(Node::MapEntry(key, value), start_span)
+                    .map(Some)
+            } else {
+                self.consume_token_and_error(SyntaxError::ExpectedMapValue)
+            }
+        } else {
+            // Valueless map entries are allowed in inline maps,
+            // e.g.
+            //   bar = -1
+            //   x = {foo: 42, bar, baz: 99}
+            match self.ast.node(key).node {
+                Node::Id(id, ..) => self.frame_mut()?.add_id_access(id),
+                _ => return self.error(SyntaxError::ExpectedMapValue),
+            }
+
+            Ok(Some(key))
+        }
+    }
+
+    fn parse_map_pattern_entries(&mut self) -> Result<AstVec<AstIndex>> {
+        let mut entries = AstVec::new();
+        let entry_context = &ExpressionContext::inside_braces();
+
+        while self.peek_token_with_context(entry_context).is_some() {
+            self.consume_until_token_with_context(entry_context);
+
+            let Some(entry) = self.parse_unpack_map_entry(BindingContext::Default)? else {
+                break;
+            };
+
+            entries.push(entry);
+
+            if matches!(
+                self.peek_token_with_context(entry_context),
+                Some(PeekInfo {
+                    token: Token::Comma,
+                    ..
+                })
+            ) {
+                self.consume_token_with_context(entry_context);
             } else {
                 break;
             }
@@ -2094,11 +2729,13 @@ impl<'source> Parser<'source> {
             Some(Token::Multiply) => MetaKeyId::Multiply,
             Some(Token::Divide) => MetaKeyId::Divide,
             Some(Token::Remainder) => MetaKeyId::Remainder,
+            Some(Token::Power) => MetaKeyId::Power,
             Some(Token::AddAssign) => MetaKeyId::AddAssign,
             Some(Token::SubtractAssign) => MetaKeyId::SubtractAssign,
             Some(Token::MultiplyAssign) => MetaKeyId::MultiplyAssign,
             Some(Token::DivideAssign) => MetaKeyId::DivideAssign,
             Some(Token::RemainderAssign) => MetaKeyId::RemainderAssign,
+            Some(Token::PowerAssign) => MetaKeyId::PowerAssign,
             Some(Token::Less) => MetaKeyId::Less,
             Some(Token::LessOrEqual) => MetaKeyId::LessOrEqual,
             Some(Token::Greater) => MetaKeyId::Greater,
@@ -2107,10 +2744,21 @@ impl<'source> Parser<'source> {
             Some(Token::NotEqual) => MetaKeyId::NotEqual,
             Some(Token::Debug) => MetaKeyId::Debug,
             Some(Token::Id) => match self.current_token.slice(self.source) {
+                "r" => match self.consume_next_token_on_same_line() {
+                    Some(Token::Add) => MetaKeyId::AddRhs,
+                    Some(Token::Subtract) => MetaKeyId::SubtractRhs,
+                    Some(Token::Multiply) => MetaKeyId::MultiplyRhs,
+                    Some(Token::Divide) => MetaKeyId::DivideRhs,
+                    Some(Token::Remainder) => MetaKeyId::RemainderRhs,
+                    Some(Token::Power) => MetaKeyId::PowerRhs,
+                    _ => return self.error(SyntaxError::UnexpectedMetaKey),
+                },
                 "call" => MetaKeyId::Call,
                 "display" => MetaKeyId::Display,
                 "index" => MetaKeyId::Index,
-                "index_mut" => MetaKeyId::IndexMut,
+                "index_assign" => MetaKeyId::IndexAssign,
+                "access" => MetaKeyId::Access,
+                "access_assign" => MetaKeyId::AccessAssign,
                 "iterator" => MetaKeyId::Iterator,
                 "next" => MetaKeyId::Next,
                 "next_back" => MetaKeyId::NextBack,
@@ -2154,18 +2802,9 @@ impl<'source> Parser<'source> {
         let start_span = self.current_span();
 
         let mut args = AstVec::new();
-        while let Some(id_or_wildcard) = self.parse_id_or_wildcard(context)? {
-            let arg_span = self.current_span();
-            let type_hint = self.parse_type_hint(context)?;
 
-            let arg_node = match id_or_wildcard {
-                IdOrWildcard::Id(id) => {
-                    self.frame_mut()?.ids_assigned_in_frame.insert(id);
-                    Node::Id(id, type_hint)
-                }
-                IdOrWildcard::Wildcard(maybe_id) => Node::Wildcard(maybe_id, type_hint),
-            };
-            args.push(self.push_node_with_span(arg_node, arg_span)?);
+        while let Some(arg) = self.parse_binding(context, BindingContext::Default)? {
+            args.push(arg);
 
             match self.peek_next_token_on_same_line() {
                 Some(Token::Comma) => {
@@ -2178,6 +2817,7 @@ impl<'source> Parser<'source> {
                 _ => return self.consume_token_and_error(SyntaxError::ExpectedForInKeyword),
             }
         }
+
         if args.is_empty() {
             return self.consume_token_and_error(SyntaxError::ExpectedForArgs);
         }
@@ -2207,9 +2847,10 @@ impl<'source> Parser<'source> {
     // Parses a loop declared with the `loop` keyword
     fn consume_loop_block(&mut self, context: &ExpressionContext) -> Result<AstIndex> {
         self.consume_token_with_context(context); // Token::Loop
+        let start_span = self.current_span();
 
         if let Some(body) = self.parse_indented_block()? {
-            self.push_node(Node::Loop { body })
+            self.push_node_with_start_span(Node::Loop { body }, start_span)
         } else {
             self.consume_token_and_error(ExpectedIndentation::LoopBody)
         }
@@ -2217,26 +2858,32 @@ impl<'source> Parser<'source> {
 
     fn consume_while_loop(&mut self, context: &ExpressionContext) -> Result<AstIndex> {
         self.consume_token_with_context(context); // Token::While
+        let start_span = self.current_span();
 
         let Some(condition) = self.parse_expression(&ExpressionContext::inline())? else {
             return self.consume_token_and_error(SyntaxError::ExpectedWhileCondition);
         };
 
         match self.parse_indented_block()? {
-            Some(body) => self.push_node(Node::While { condition, body }),
+            Some(body) => {
+                self.push_node_with_start_span(Node::While { condition, body }, start_span)
+            }
             None => self.consume_token_and_error(ExpectedIndentation::WhileBody),
         }
     }
 
     fn consume_until_loop(&mut self, context: &ExpressionContext) -> Result<AstIndex> {
         self.consume_token_with_context(context); // Token::Until
+        let start_span = self.current_span();
 
         let Some(condition) = self.parse_expression(&ExpressionContext::inline())? else {
             return self.consume_token_and_error(SyntaxError::ExpectedUntilCondition);
         };
 
         match self.parse_indented_block()? {
-            Some(body) => self.push_node(Node::Until { condition, body }),
+            Some(body) => {
+                self.push_node_with_start_span(Node::Until { condition, body }, start_span)
+            }
             None => self.consume_token_and_error(ExpectedIndentation::UntilBody),
         }
     }
@@ -2245,7 +2892,6 @@ impl<'source> Parser<'source> {
         use SyntaxError::*;
 
         self.consume_token_with_context(context); // Token::If
-
         let if_span = self.current_span();
 
         // Define the expected indentation of 'else if' / 'else' blocks
@@ -2280,6 +2926,7 @@ impl<'source> Parser<'source> {
                     then_node,
                     else_if_blocks: astvec![],
                     else_node,
+                    inline: true,
                 }),
                 if_span,
             )
@@ -2339,6 +2986,7 @@ impl<'source> Parser<'source> {
                         then_node,
                         else_if_blocks,
                         else_node,
+                        inline: false,
                     }),
                     if_span,
                 )
@@ -2357,7 +3005,7 @@ impl<'source> Parser<'source> {
         self.consume_token_with_context(switch_context); // Token::Switch
 
         let current_indent = self.current_indent();
-        let switch_span = self.current_span();
+        let switch_start_span = self.current_span();
 
         let arm_context = match self.consume_until_token_with_context(switch_context) {
             Some(arm_context) if self.current_indent() > current_indent => arm_context,
@@ -2365,17 +3013,24 @@ impl<'source> Parser<'source> {
         };
 
         let mut arms = AstVec::new();
+        let mut else_arm_encountered = false;
 
         while self.peek_token().is_some() {
             let condition = self.parse_expression(&ExpressionContext::inline())?;
 
+            let arm_start_span;
             let arm_body = match self.peek_next_token_on_same_line() {
                 Some(Token::Else) => {
                     if condition.is_some() {
                         return self.consume_token_and_error(UnexpectedSwitchElse);
                     }
+                    if else_arm_encountered {
+                        return Err(Error::new(SwitchElseNotInLastArm.into(), switch_start_span));
+                    }
 
                     self.consume_next_token_on_same_line();
+                    arm_start_span = self.current_span();
+                    else_arm_encountered = true;
 
                     if let Some(expression) =
                         self.parse_expressions(&ExpressionContext::inline(), TempResult::No)?
@@ -2388,7 +3043,14 @@ impl<'source> Parser<'source> {
                     }
                 }
                 Some(Token::Then) => {
+                    if else_arm_encountered {
+                        return Err(Error::new(SwitchElseNotInLastArm.into(), switch_start_span));
+                    }
+                    let Some(condition) = condition else {
+                        return self.consume_token_and_error(UnexpectedSwitchThen);
+                    };
                     self.consume_next_token_on_same_line();
+                    arm_start_span = self.node_span(condition);
 
                     if let Some(expression) =
                         self.parse_expressions(&ExpressionContext::inline(), TempResult::No)?
@@ -2403,10 +3065,14 @@ impl<'source> Parser<'source> {
                 _ => return self.consume_token_and_error(ExpectedSwitchArmExpression),
             };
 
-            arms.push(SwitchArm {
-                condition,
-                expression: arm_body,
-            });
+            let arm_node = self.push_node_with_start_span(
+                Node::SwitchArm {
+                    condition,
+                    expression: arm_body,
+                },
+                arm_start_span,
+            )?;
+            arms.push(arm_node);
 
             if self.peek_token_with_context(&arm_context).is_none() {
                 break;
@@ -2415,16 +3081,7 @@ impl<'source> Parser<'source> {
             self.consume_until_token_with_context(&arm_context);
         }
 
-        // Check for errors now that the match expression is complete
-        for (arm_index, arm) in arms.iter().enumerate() {
-            let last_arm = arm_index == arms.len() - 1;
-
-            if arm.condition.is_none() && !last_arm {
-                return Err(Error::new(SwitchElseNotInLastArm.into(), switch_span));
-            }
-        }
-
-        self.push_node_with_span(Node::Switch(arms), switch_span)
+        self.push_node_with_span(Node::Switch(arms), switch_start_span)
     }
 
     fn consume_match_expression(&mut self, match_context: &ExpressionContext) -> Result<AstIndex> {
@@ -2433,7 +3090,7 @@ impl<'source> Parser<'source> {
         self.consume_token_with_context(match_context); // Token::Match
 
         let current_indent = self.current_indent();
-        let match_span = self.current_span();
+        let match_start_span = self.current_span();
 
         let match_expression =
             match self.parse_expressions(&ExpressionContext::inline(), TempResult::Yes)? {
@@ -2448,7 +3105,8 @@ impl<'source> Parser<'source> {
             _ => return self.consume_token_on_same_line_and_error(ExpectedIndentation::MatchArm),
         };
 
-        let mut arms = Vec::new();
+        let mut arms = AstVec::new();
+        let mut else_arm_encountered = false;
 
         while self.peek_token().is_some() {
             // Match patterns for a single arm, with alternatives separated by 'or'
@@ -2459,8 +3117,14 @@ impl<'source> Parser<'source> {
             let mut arm_patterns = AstVec::new();
             let mut expected_arm_count = 1;
 
+            let mut arm_start_span = match_start_span;
+
             let condition = {
                 while let Some(pattern) = self.parse_match_pattern(false)? {
+                    if else_arm_encountered {
+                        return Err(Error::new(MatchElseNotInLastArm.into(), match_start_span));
+                    }
+
                     // Match patterns, separated by commas in the case of matching multi-expressions
                     let mut patterns = astvec![pattern];
 
@@ -2496,13 +3160,22 @@ impl<'source> Parser<'source> {
                 }
             };
 
+            if let Some(first_pattern) = arm_patterns.first() {
+                arm_start_span = self.node_span(*first_pattern);
+            }
+
             let arm_body = match self.peek_next_token_on_same_line() {
                 Some(Token::Else) => {
+                    if else_arm_encountered {
+                        return Err(Error::new(MatchElseNotInLastArm.into(), match_start_span));
+                    }
                     if !arm_patterns.is_empty() || condition.is_some() {
                         return self.consume_token_and_error(UnexpectedMatchElse);
                     }
 
                     self.consume_next_token_on_same_line();
+                    arm_start_span = self.current_span();
+                    else_arm_encountered = true;
 
                     if let Some(expression) =
                         self.parse_expressions(&ExpressionContext::inline(), TempResult::No)?
@@ -2535,11 +3208,15 @@ impl<'source> Parser<'source> {
                 _ => return self.consume_token_and_error(ExpectedMatchArmExpression),
             };
 
-            arms.push(MatchArm {
-                patterns: arm_patterns,
-                condition,
-                expression: arm_body,
-            });
+            let arm_node = self.push_node_with_start_span(
+                Node::MatchArm {
+                    patterns: arm_patterns,
+                    condition,
+                    expression: arm_body,
+                },
+                arm_start_span,
+            )?;
+            arms.push(arm_node);
 
             if self.peek_token_with_context(&arm_context).is_none() {
                 break;
@@ -2548,22 +3225,12 @@ impl<'source> Parser<'source> {
             self.consume_until_token_with_context(&arm_context);
         }
 
-        // Check for errors now that the match expression is complete
-
-        for (arm_index, arm) in arms.iter().enumerate() {
-            let last_arm = arm_index == arms.len() - 1;
-
-            if arm.patterns.is_empty() && arm.condition.is_none() && !last_arm {
-                return Err(Error::new(MatchElseNotInLastArm.into(), match_span));
-            }
-        }
-
         self.push_node_with_span(
             Node::Match {
                 expression: match_expression,
                 arms,
             },
-            match_span,
+            match_start_span,
         )
     }
 
@@ -2606,12 +3273,14 @@ impl<'source> Parser<'source> {
                     }
                     None => return self.error(InternalError::IdParseFailure),
                 },
-                Wildcard => {
-                    let wildcard = self.consume_wildcard(&pattern_context)?;
-                    let wildcard_span = self.current_span();
+                Underscore => {
+                    let ignored_id = self.consume_ignored_id(&pattern_context)?;
+                    let ignored_id_span = self.current_span();
                     let maybe_type = self.parse_type_hint(&pattern_context)?;
-                    let result = self
-                        .push_node_with_span(Node::Wildcard(wildcard, maybe_type), wildcard_span)?;
+                    let result = self.push_node_with_span(
+                        Node::Ignored(ignored_id, maybe_type),
+                        ignored_id_span,
+                    )?;
                     Some(result)
                 }
                 RoundOpen => {
@@ -2627,12 +3296,35 @@ impl<'source> Parser<'source> {
                             return self.error(SyntaxError::ExpectedCloseParen);
                         }
 
-                        Some(self.push_node(Node::Tuple(tuple_patterns))?)
+                        Some(self.push_node(Node::Tuple {
+                            elements: tuple_patterns,
+                            parentheses: true,
+                        })?)
                     }
                 }
                 Ellipsis if in_nested_patterns => {
                     self.consume_token_with_context(&pattern_context);
                     Some(self.push_node(Node::PackedId(None))?)
+                }
+                CurlyOpen => {
+                    self.consume_token_with_context(&pattern_context); // Token::CurlyOpen
+
+                    let start_span = self.current_span();
+
+                    let entries = self.parse_map_pattern_entries()?;
+
+                    self.expect_and_consume_token(
+                        Token::CurlyClose,
+                        SyntaxError::ExpectedMapEnd.into(),
+                        &ExpressionContext::inside_braces(),
+                    )?;
+
+                    let type_hint = self.parse_type_hint(&pattern_context)?;
+
+                    Some(self.push_node_with_start_span(
+                        Node::MapPattern { entries, type_hint },
+                        start_span,
+                    )?)
                 }
                 _ => None,
             },
@@ -2672,7 +3364,7 @@ impl<'source> Parser<'source> {
         };
 
         let start_span = self.current_span();
-        let from_context = ExpressionContext::restricted();
+        let from_context = ExpressionContext::permissive();
 
         let from = if importing_from {
             // Parse the from module path: a nested path is allowed, but only a single path
@@ -2709,6 +3401,10 @@ impl<'source> Parser<'source> {
             }
         }
 
+        if from.is_empty() && items.is_empty() {
+            return self.error(SyntaxError::MissingModuleForWildcardImport);
+        }
+
         self.push_node_with_start_span(Node::Import { from, items }, start_span)
     }
 
@@ -2738,10 +3434,20 @@ impl<'source> Parser<'source> {
 
     // Helper for parse_import(), parses a series of import items
     // e.g.
-    //   from baz.qux import foo, 'bar', 'x'
-    //   #    ^ You are here, with nested items allowed
-    //   #                   ^ Or here, with nested items disallowed
+    //   import baz, baz2
+    //   #     ^ You are here
+    //   from baz.qux import *
+    //   #                  ^ ...or here
     fn consume_import_items(&mut self, context: &ExpressionContext) -> Result<Vec<ImportItem>> {
+        // `*` wildcard import?
+        if let Some(Token::Multiply) = self
+            .peek_token_with_context(context)
+            .map(|token| token.token)
+        {
+            self.consume_token_with_context(context);
+            return Ok(Vec::default());
+        }
+
         let mut items = Vec::new();
         let mut context = *context;
 
@@ -2844,17 +3550,8 @@ impl<'source> Parser<'source> {
 
         self.consume_token_with_context(context);
 
-        let catch_arg = match self.parse_id_or_wildcard(&ExpressionContext::restricted())? {
-            Some(IdOrWildcard::Id(id)) => {
-                let type_hint_index = self.parse_type_hint(context)?;
-                self.frame_mut()?.ids_assigned_in_frame.insert(id);
-                self.push_node(Node::Id(id, type_hint_index))?
-            }
-            Some(IdOrWildcard::Wildcard(maybe_id)) => {
-                let type_hint_index = self.parse_type_hint(context)?;
-                self.push_node(Node::Wildcard(maybe_id, type_hint_index))?
-            }
-            None => return self.consume_token_and_error(SyntaxError::ExpectedCatchArgument),
+        let Some(catch_arg) = self.parse_binding(context, BindingContext::Default)? else {
+            return self.consume_token_and_error(SyntaxError::ExpectedCatchArgument);
         };
 
         let Some(catch_block) = self.parse_indented_block()? else {
@@ -2872,23 +3569,12 @@ impl<'source> Parser<'source> {
     fn consume_let_expression(&mut self, context: &ExpressionContext) -> Result<AstIndex> {
         self.consume_token_with_context(context); // Token::Let
 
-        let mut targets = vec![];
+        let mut targets = AstVec::new();
 
-        while let Some(id_or_wildcard) =
-            self.parse_id_or_wildcard(&ExpressionContext::permissive())?
+        while let Some(target) =
+            self.parse_binding(&ExpressionContext::permissive(), BindingContext::Let)?
         {
-            let target_span = self.current_span();
-            let target_node = match id_or_wildcard {
-                IdOrWildcard::Id(constant_index) => {
-                    let type_hint_index = self.parse_type_hint(context)?;
-                    Node::Id(constant_index, type_hint_index)
-                }
-                IdOrWildcard::Wildcard(maybe_id) => {
-                    let type_hint_index = self.parse_type_hint(context)?;
-                    Node::Wildcard(maybe_id, type_hint_index)
-                }
-            };
-            targets.push(self.push_node_with_span(target_node, target_span)?);
+            targets.push(target);
 
             if let Some(Token::Comma) = self
                 .peek_token_with_context(context)
@@ -2902,7 +3588,7 @@ impl<'source> Parser<'source> {
             return self.error(SyntaxError::ExpectedAssignmentTarget);
         };
 
-        match self.parse_assign_expression(last_target, &targets, context)? {
+        match self.parse_assign_expression(last_target, &targets, context, true)? {
             Some(val) => Ok(val),
             None => self.consume_token_and_error(SyntaxError::ExpectedAssignmentTarget),
         }
@@ -2933,20 +3619,26 @@ impl<'source> Parser<'source> {
                 StringLiteral => {
                     let string_literal = self.current_token.slice(self.source);
 
-                    let mut contents = String::with_capacity(string_literal.len());
-                    let mut chars = string_literal.chars().peekable();
+                    let literal_constant = if self.options.process_escape_codes {
+                        let mut contents = String::with_capacity(string_literal.len());
+                        let mut chars = string_literal.chars().peekable();
 
-                    while let Some(c) = chars.next() {
-                        if c == '\\' {
-                            if let Some(escaped) = self.escape_string_character(&mut chars)? {
-                                contents.push(escaped);
+                        while let Some(c) = chars.next() {
+                            if c == '\\' {
+                                if let Some(escaped) = self.escape_string_character(&mut chars)? {
+                                    contents.push(escaped);
+                                }
+                            } else {
+                                contents.push(c);
                             }
-                        } else {
-                            contents.push(c);
                         }
-                    }
 
-                    nodes.push(StringNode::Literal(self.add_string_constant(&contents)?));
+                        self.add_string_constant(&contents)?
+                    } else {
+                        self.add_string_constant(string_literal)?
+                    };
+
+                    nodes.push(StringNode::Literal(literal_constant));
                 }
                 CurlyOpen => {
                     let Some(expression) =
@@ -3143,15 +3835,37 @@ impl<'source> Parser<'source> {
     where
         E: Into<ErrorKind>,
     {
-        Err(self.make_error(error_type))
+        self.error_with_span(error_type, self.current_span())
+    }
+
+    fn error_with_span<E, T>(&mut self, error_type: E, span: Span) -> Result<T>
+    where
+        E: Into<ErrorKind>,
+    {
+        Err(self.make_error_with_span(error_type, span))
+    }
+
+    fn error_with_span_of<E, T>(&mut self, error_type: E, index: AstIndex) -> Result<T>
+    where
+        E: Into<ErrorKind>,
+    {
+        let span = *self.ast.span(self.ast.node(index).span);
+        Err(self.make_error_with_span(error_type, span))
     }
 
     fn make_error<E>(&mut self, error_type: E) -> Error
     where
         E: Into<ErrorKind>,
     {
+        self.make_error_with_span(error_type, self.current_span())
+    }
+
+    fn make_error_with_span<E>(&mut self, error_type: E, span: Span) -> Error
+    where
+        E: Into<ErrorKind>,
+    {
         #[allow(clippy::let_and_return)]
-        let error = Error::new(error_type.into(), self.current_span());
+        let error = Error::new(error_type.into(), span);
 
         #[cfg(feature = "panic_on_parser_error")]
         panic!("{error}");
@@ -3180,11 +3894,6 @@ impl<'source> Parser<'source> {
     fn consume_token(&mut self) -> Option<Token> {
         if let Some(next) = self.lexer.next() {
             self.current_token = next;
-
-            if self.current_token.token == Token::NewLine {
-                self.current_line += 1;
-            }
-
             Some(self.current_token.token)
         } else {
             None
@@ -3199,8 +3908,16 @@ impl<'source> Parser<'source> {
         self.lexer.peek(n).map(|peeked| peeked.token)
     }
 
+    fn current_line(&self) -> u32 {
+        self.current_token.span.end.line
+    }
+
     fn current_indent(&self) -> usize {
         self.current_token.indent
+    }
+
+    fn peek_span(&mut self) -> Option<Span> {
+        self.lexer.peek(0).map(|peeked| peeked.span)
     }
 
     fn current_span(&self) -> Span {
@@ -3219,6 +3936,10 @@ impl<'source> Parser<'source> {
 
     fn push_node_with_start_span(&mut self, node: Node, start_span: Span) -> Result<AstIndex> {
         self.push_node_with_span(node, self.span_with_start(start_span))
+    }
+
+    fn node_span(&self, node_index: AstIndex) -> Span {
+        *self.ast.span(self.ast.node(node_index).span)
     }
 
     fn span_with_start(&self, start_span: Span) -> Span {
@@ -3307,12 +4028,12 @@ impl<'source> Parser<'source> {
         &mut self,
         context: &ExpressionContext,
     ) -> Option<(Token, ExpressionContext)> {
-        let start_line = self.current_line;
+        let start_line = self.current_line();
         let start_indent = self.current_indent();
 
         while let Some(token) = self.consume_token() {
             if !(token.is_whitespace_including_newline()) {
-                let is_indented_block = self.current_line > start_line
+                let is_indented_block = self.current_line() > start_line
                     && self.current_indent() > start_indent
                     && context.allow_linebreaks
                     && matches!(context.expected_indentation, Indentation::Greater);
@@ -3341,7 +4062,7 @@ impl<'source> Parser<'source> {
         &mut self,
         context: &ExpressionContext,
     ) -> Option<ExpressionContext> {
-        let start_line = self.current_line;
+        let start_line = self.current_line();
         let start_indent = self.current_indent();
 
         while let Some(peeked) = self.lexer.peek(0) {
@@ -3378,6 +4099,22 @@ impl<'source> Parser<'source> {
             match peeked {
                 token if token.is_whitespace() => {}
                 token => return Some(token),
+            }
+
+            peek_count += 1;
+        }
+
+        None
+    }
+
+    // Peeks past whitespace on the same line until the next token is found
+    fn peek_next_token_on_same_line_with_span(&mut self) -> Option<(Token, Span)> {
+        let mut peek_count = 0;
+
+        while let Some(peeked) = self.lexer.peek(peek_count) {
+            match peeked.token {
+                token if token.is_whitespace() => {}
+                token => return Some((token, peeked.span)),
             }
 
             peek_count += 1;
@@ -3440,29 +4177,33 @@ enum TempResult {
     Yes,
 }
 
-// The first operator that's above the pipe operator >> in precedence.
+// The first operator that's above the pipe operator -> in precedence.
 // Q: Why is this needed?
 // A: Function calls without parentheses aren't currently treated as operators (a Call operator
 //    with higher precedence than Pipe would allow this to go away, but would likely take quite a
 //    bit of reworking. All calls to parse_call_args will need to reworked).
 //    parse_call_args needs to parse arguments as expressions with a minimum precedence that
-//    excludes piping, otherwise `f g >> x` would be parsed as `f (g >> x)` instead of `(f g) >> x`.
+//    excludes piping, otherwise `f g -> x` would be parsed as `f (g -> x)` instead of `(f g) -> x`.
 const MIN_PRECEDENCE_AFTER_PIPE: u8 = 3;
 
 fn operator_precedence(op: Token) -> Option<(u8, u8)> {
     use Token::*;
     let priority = match op {
+        // Pipe operator, left-associative
         Arrow => (1, 2),
-        AddAssign | SubtractAssign | MultiplyAssign | DivideAssign | RemainderAssign => {
-            (4, MIN_PRECEDENCE_AFTER_PIPE)
-        }
-        Or => (7, 8),
-        And => (9, 10),
-        // Chained comparisons require right-associativity
-        Equal | NotEqual => (12, 11),
-        Greater | GreaterOrEqual | Less | LessOrEqual => (14, 13),
-        Add | Subtract => (15, 16),
-        Multiply | Divide | Remainder => (17, 18),
+        // Compound assignments, right-associative
+        AddAssign | SubtractAssign | MultiplyAssign | DivideAssign | RemainderAssign
+        | PowerAssign => (4, MIN_PRECEDENCE_AFTER_PIPE),
+        // Logical operators, left-associative
+        Or => (5, 6),
+        And => (7, 8),
+        // Comparisons, right-associative
+        Equal | NotEqual => (10, 9),
+        Greater | GreaterOrEqual | Less | LessOrEqual => (12, 11),
+        // Arithmetic operators, left-associative
+        Add | Subtract => (13, 14),
+        Multiply | Divide | Remainder => (15, 16),
+        Power => (17, 18),
         _ => return None,
     };
     Some(priority)
@@ -3476,11 +4217,11 @@ struct PeekInfo {
     info: LexedToken,
 }
 
-// Returned by Parser::parse_id_or_wildcard()
+// Returned by Parser::parse_id_or_ignored()
 #[derive(Debug)]
-enum IdOrWildcard {
+enum IdOrIgnored {
     Id(ConstantIndex),
-    Wildcard(Option<ConstantIndex>),
+    Ignored(Option<ConstantIndex>),
 }
 
 // Returned by Parser::parse_string()
@@ -3488,4 +4229,45 @@ struct ParseStringOutput {
     string: AstString,
     span: Span,
     context: ExpressionContext,
+}
+
+enum BindingContext<'a> {
+    // A binding in general expressions,
+    // e.g. `for {x, y} in foo`, `catch {x, y}`, match arms, or basic assignments.
+    Default,
+    // A let binding, e.g. `let {x, y} = my_map`.
+    Let,
+    // Within function arguments
+    Function(&'a mut Frame),
+}
+
+impl<'a> BindingContext<'a> {
+    fn reborrow(&'_ mut self) -> BindingContext<'_> {
+        use BindingContext::*;
+
+        match self {
+            Default => Default,
+            Let => Let,
+            Function(frame) => Function(frame),
+        }
+    }
+
+    fn add_assigned_id(&mut self, parser: &mut Parser, id: ConstantIndex) -> Result<()> {
+        use BindingContext::*;
+
+        match self {
+            Let => {
+                // id assignments will be registered when
+                // encountering the '='
+            }
+            Default => {
+                parser.frame_mut()?.ids_assigned_in_frame.insert(id);
+            }
+            Function(frame) => {
+                frame.ids_assigned_in_frame.insert(id);
+            }
+        }
+
+        Ok(())
+    }
 }

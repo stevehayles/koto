@@ -235,6 +235,19 @@ y.next().get()
         }
     }
 
+    mod generate {
+        use super::*;
+
+        #[test]
+        fn with_inline_function() {
+            let script = "
+add = |a, b| a + b
+iterator.generate(|| add(2, 3), 5).to_tuple()
+";
+            check_script_output(script, number_tuple(&[5, 5, 5, 5, 5]));
+        }
+    }
+
     mod keep {
         use super::*;
 
@@ -248,6 +261,24 @@ x.next().get() # 'e'
 y.next().get()
 ";
             check_script_output(script, "e");
+        }
+
+        #[test]
+        fn keep_with_unpacked_map_entries() {
+            let script = "
+x = {x: 10, y: 20, z: 30}
+x.keep(|(_, value)| value > 15).count()
+";
+            check_script_output(script, 2);
+        }
+
+        #[test]
+        fn keep_with_type_checked_map_entries() {
+            let script = "
+x = {x: 10, y: 20, z: 30}
+x.keep(|(_: String, value: Number)| value > 15).count()
+";
+            check_script_output(script, 2);
         }
     }
 
@@ -456,6 +487,19 @@ x.next().get() # (3, 13)
 y.next().get()
 ";
             check_script_output(script, number_tuple(&[3, 13]));
+        }
+
+        #[test]
+        fn for_loop_over_many_zipped_values() {
+            // This ensures that unpacking temporary value pairs in a for loop
+            // doesn't overflow the register stack.
+            let script = "
+r = 1..=128
+for a, b in r.zip r
+  () # no-op
+b
+";
+            check_script_output(script, 128);
         }
     }
 }

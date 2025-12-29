@@ -1,24 +1,27 @@
 use std::{
-    cell::{Ref, RefCell, RefMut},
     fmt,
     ops::{Deref, DerefMut},
 };
 
-use crate::Ptr;
+use crate::{
+    Ptr,
+    ptr_impl::{
+        BorrowImpl, BorrowMutImpl, CellImpl, borrow, borrow_mut, borrowed_filter_map,
+        borrowed_mut_filter_map, try_borrow, try_borrow_mut,
+    },
+};
 
 /// Makes a PtrMut, with support for casting to trait objects
 ///
-/// Although PtrMut::from is available, the challenge comes when a trait object needs to be used as
+/// Although `PtrMut::from` is available, the challenge comes when a trait object needs to be used as
 /// the pointer type. Until the `CoerceUnized` trait is stabilized, casting from a concrete type to
 /// `dyn Trait` needs to be performed on the inner pointer. This macro encapsulates the casting to
 /// make life easier at the call site.
 #[macro_export]
 macro_rules! make_ptr_mut {
-    ($value:expr) => {{
-        use std::rc::Rc;
-
-        PtrMut::from(Rc::from(KCell::from($value)) as Rc<KCell<_>>)
-    }};
+    ($value:expr) => {
+        $crate::make_ptr!($crate::KCell::from($value))
+    };
 }
 
 /// A mutable pointer to a value in allocated memory
@@ -32,11 +35,11 @@ impl<T> From<T> for PtrMut<T> {
 
 /// A mutable value with borrowing checked at runtime
 #[derive(Debug, Default)]
-pub struct KCell<T: ?Sized>(RefCell<T>);
+pub struct KCell<T: ?Sized>(CellImpl<T>);
 
 impl<T> From<T> for KCell<T> {
     fn from(value: T) -> Self {
-        Self(RefCell::from(value))
+        Self(CellImpl::from(value))
     }
 }
 
@@ -45,44 +48,49 @@ impl<T: ?Sized> KCell<T> {
     ///
     /// Multiple immutable borrows can be made at the same time.
     ///
-    /// If the value is currently mutably borrowed then this function will block.
-    /// See `try_borrow` for a non-blocking version.
-    pub fn borrow(&self) -> Borrow<T> {
-        Borrow::new(self.0.borrow())
+    /// # Feature-specific behavior
+    ///
+    /// If the value is currently mutably borrowed then
+    /// - with the "rc" feature, this will panic
+    /// - with the "arc" feature, this will block
+    ///
+    /// See `try_borrow` for a non-panicking/non-blocking version.
+    pub fn borrow(&self) -> Borrow<'_, T> {
+        Borrow(borrow(&self.0))
     }
 
     /// Attempts to mutably borrow the wrapped value.
     ///
     /// Returns an error if the value is currently mutably borrowed.
     pub fn try_borrow(&self) -> Option<Borrow<'_, T>> {
-        self.0.try_borrow().ok().map(Borrow::new)
+        try_borrow(&self.0).map(Borrow)
     }
 
     /// Mutably borrows the wrapped value.
     ///
-    /// If the value is currently borrowed then this function will panic.
+    /// # Feature-specific behavior
+    ///
+    /// If the value is currently borrowed then
+    /// - with the "rc" feature, this will panic
+    /// - with the "arc" feature, this will block
     ///
     /// See `try_borrow_mut` for a non-panicking version.
-    pub fn borrow_mut(&self) -> BorrowMut<T> {
-        BorrowMut::new(self.0.borrow_mut())
+    pub fn borrow_mut(&self) -> BorrowMut<'_, T> {
+        BorrowMut(borrow_mut(&self.0))
     }
 
     /// Attempts to mutably borrow the wrapped value.
     ///
     /// Returns an error if the value is currently mutably borrowed.
     pub fn try_borrow_mut(&self) -> Option<BorrowMut<'_, T>> {
-        self.0.try_borrow_mut().ok().map(BorrowMut::new)
+        try_borrow_mut(&self.0).map(BorrowMut)
     }
 }
 
 /// An immutably borrowed reference to a value borrowed from a [PtrMut]
-pub struct Borrow<'a, T: ?Sized>(Ref<'a, T>);
+pub struct Borrow<'a, T: ?Sized>(BorrowImpl<'a, T>);
 
 impl<'a, T: ?Sized> Borrow<'a, T> {
-    fn new(guard: Ref<'a, T>) -> Self {
-        Self(Ref::map(guard, |x| x))
-    }
-
     /// Makes a new Borrow for an optional component of the borrowed data.
     /// If the closure returns None then the original borrow is returned as the error.
     pub fn filter_map<U, F>(borrowed: Self, f: F) -> Result<Borrow<'a, U>, Self>
@@ -90,7 +98,9 @@ impl<'a, T: ?Sized> Borrow<'a, T> {
         F: FnOnce(&T) -> Option<&U>,
         U: ?Sized,
     {
-        Ref::filter_map(borrowed.0, f).map(Borrow).map_err(Borrow)
+        borrowed_filter_map(borrowed.0, f)
+            .map(Borrow)
+            .map_err(Borrow)
     }
 }
 
@@ -110,13 +120,9 @@ impl<T: ?Sized + fmt::Display> fmt::Display for Borrow<'_, T> {
 }
 
 /// A mutably borrowed reference to a value borrowed from a [PtrMut]
-pub struct BorrowMut<'a, T: ?Sized>(RefMut<'a, T>);
+pub struct BorrowMut<'a, T: ?Sized>(BorrowMutImpl<'a, T>);
 
 impl<'a, T: ?Sized> BorrowMut<'a, T> {
-    fn new(guard: RefMut<'a, T>) -> Self {
-        Self(RefMut::map(guard, |x| x))
-    }
-
     /// Makes a new BorrowMut for an optional component of the borrowed data.
     /// If the closure returns None then the original borrow is returned as the error.
     pub fn filter_map<U, F>(borrowed: Self, f: F) -> Result<BorrowMut<'a, U>, Self>
@@ -124,7 +130,7 @@ impl<'a, T: ?Sized> BorrowMut<'a, T> {
         F: FnOnce(&mut T) -> Option<&mut U>,
         U: ?Sized,
     {
-        RefMut::filter_map(borrowed.0, f)
+        borrowed_mut_filter_map(borrowed.0, f)
             .map(BorrowMut)
             .map_err(BorrowMut)
     }

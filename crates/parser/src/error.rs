@@ -69,7 +69,7 @@ pub enum ExpectedIndentation {
     WhileBody,
 }
 
-/// A syntax error encountered by the [Parser]
+/// A syntax error encountered by the [Parser][crate::Parser]
 #[derive(Error, Clone, Debug)]
 #[allow(missing_docs)]
 pub enum SyntaxError {
@@ -127,10 +127,18 @@ pub enum SyntaxError {
     ExpectedMapEnd,
     #[error("expected map entry")]
     ExpectedMapEntry,
-    #[error("expected key after '.' in Map access")]
+    #[error("expected id or string for '.' access")]
     ExpectedMapKey,
-    #[error("expected value after ':' in Map")]
+    #[error("expected value after ':' in map entry")]
     ExpectedMapValue,
+    #[error("expected map assignment entry")]
+    ExpectedMapAssignmentEntry,
+    #[error("expected an id after 'as' in unpacked map")]
+    ExpectedUnpackedMapKeyRebindId,
+    #[error("expected 'as' after a string key")]
+    ExpectedMapPatAsAfterString,
+    #[error("expected id or string as the key in map pattern")]
+    ExpectedMapPatKey,
     #[error("expected expression in match arm")]
     ExpectedMatchArmExpression,
     #[error("expected expression after then in match arm")]
@@ -171,8 +179,12 @@ pub enum SyntaxError {
     MatchEllipsisOutsideOfNestedPatterns,
     #[error("'else' can only be used in the last arm in a match expression")]
     MatchElseNotInLastArm,
+    #[error("Missing 'from' for wildcard import")]
+    MissingModuleForWildcardImport,
     #[error("nested types aren't currently supported")]
     NestedTypesArentSupported,
+    #[error("floating point literals aren't supported for non-decimal bases")]
+    NonDecimalFloatsAreUnsupported,
     #[error("keyword reserved for future use")]
     ReservedKeyword,
     #[error("'self' doesn't need to be declared as an argument")]
@@ -193,6 +205,8 @@ pub enum SyntaxError {
     UnexpectedMetaKey,
     #[error("unexpected 'else' in switch arm")]
     UnexpectedSwitchElse,
+    #[error("condition expected before 'then' in switch arm")]
+    UnexpectedSwitchThen,
     #[error("unexpected '?'")]
     UnexpectedNullCheck,
     #[error("unexpected token")]
@@ -203,9 +217,13 @@ pub enum SyntaxError {
     UnterminatedNumericEscapeCode,
     #[error("unterminated string")]
     UnterminatedString,
+    #[error("unexpected 'as' after map key")]
+    UnexpectedMapKeyRebindOnRhs,
+    #[error("unexpected type hint in unpacked map (`let` is required to use type hints)")]
+    UnexpectedMapKeyTypeHint,
 }
 
-/// See [`ParserError`]
+/// See [`Error`][crate::Error]
 #[derive(Error, Clone, Debug)]
 #[allow(missing_docs)]
 pub enum ErrorKind {
@@ -225,14 +243,24 @@ pub enum ErrorKind {
 pub struct Error {
     /// The error itself
     pub error: ErrorKind,
+
     /// The span in the source string where the error occurred
     pub span: Span,
+
+    /// The partially parsed AST up to the point where the error occurred
+    #[cfg(feature = "error_ast")]
+    pub ast: Option<Box<crate::Ast>>,
 }
 
 impl Error {
     /// Initializes a parser error with the specific error type and its associated span
     pub fn new(error: ErrorKind, span: Span) -> Self {
-        Self { error, span }
+        Self {
+            error,
+            span,
+            #[cfg(feature = "error_ast")]
+            ast: None,
+        }
     }
 
     /// Returns true if the error was caused by the expectation of indentation

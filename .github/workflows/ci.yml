@@ -12,7 +12,7 @@ jobs:
   build_and_test:
     strategy:
       matrix:
-        os: [macos-13, ubuntu-22.04, windows-2022]
+        os: [macos-15, macos-15-intel, ubuntu-24.04, windows-2025]
 
     runs-on: ${{ matrix.os }}
 
@@ -22,6 +22,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just@1.5.0
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build
         run: cargo build --verbose
@@ -42,6 +43,10 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just@1.5.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: restore timestamps
+        uses: chetan/git-restore-mtime-action@v2
 
       - name: Test with optimizations
         run: just test_release --verbose
@@ -56,6 +61,10 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just@1.5.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: restore timestamps
+        uses: chetan/git-restore-mtime-action@v2
 
       - name: Test the arc build variant
         run: just test_arc --verbose
@@ -70,6 +79,10 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just@1.5.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: restore timestamps
+        uses: chetan/git-restore-mtime-action@v2
 
       - name: Test the arc build variant
         run: just test_arc --release --verbose
@@ -85,6 +98,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just@1.5.0,mlc@0.16.3
+      - uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
         run: just fmt
@@ -109,6 +123,7 @@ jobs:
       - uses: jetli/wasm-pack-action@v0.4.0
         with:
           version: v0.13.1
+      - uses: Swatinem/rust-cache@v2
 
       - name: Run wasm example tests
         run: cd crates/koto/examples/wasm && wasm-pack test --node

@@ -15,7 +15,6 @@ pub enum Token {
     CommentMulti,
     Number,
     Id,
-    Wildcard,
 
     StringStart(StringType),
     StringEnd,
@@ -37,6 +36,7 @@ pub enum Token {
     Range,
     RangeInclusive,
     Semicolon,
+    Underscore,
     QuestionMark,
 
     // operators
@@ -45,6 +45,7 @@ pub enum Token {
     Multiply,
     Divide,
     Remainder,
+    Power,
 
     Assign,
     AddAssign,
@@ -52,6 +53,7 @@ pub enum Token {
     MultiplyAssign,
     DivideAssign,
     RemainderAssign,
+    PowerAssign,
 
     Equal,
     NotEqual,
@@ -138,6 +140,16 @@ pub struct RawStringDelimiter {
 pub enum StringQuote {
     Double,
     Single,
+}
+
+impl StringQuote {
+    /// Returns a char representing the quote
+    pub fn as_char(&self) -> char {
+        match self {
+            Self::Double => '"',
+            Self::Single => '\'',
+        }
+    }
 }
 
 impl TryFrom<char> for StringQuote {
@@ -684,7 +696,7 @@ impl<'a> TokenLexer<'a> {
         Token::Id
     }
 
-    fn consume_wildcard(&mut self, mut chars: Peekable<Chars>) -> Token {
+    fn consume_ignored(&mut self, mut chars: Peekable<Chars>) -> Token {
         // The _ has already been matched
         let c = chars.next().unwrap();
 
@@ -693,7 +705,7 @@ impl<'a> TokenLexer<'a> {
         let char_count = 1 + char_count;
 
         self.advance_line_utf8(char_bytes, char_count);
-        Token::Wildcard
+        Token::Underscore
     }
 
     fn consume_symbol(&mut self, remaining: &str) -> Option<Token> {
@@ -728,12 +740,14 @@ impl<'a> TokenLexer<'a> {
         check_symbol!("*=", MultiplyAssign);
         check_symbol!("/=", DivideAssign);
         check_symbol!("%=", RemainderAssign);
+        check_symbol!("^=", PowerAssign);
 
         check_symbol!("+", Add);
         check_symbol!("-", Subtract);
         check_symbol!("*", Multiply);
         check_symbol!("/", Divide);
         check_symbol!("%", Remainder);
+        check_symbol!("^", Power);
 
         check_symbol!("@", At);
         check_symbol!(":", Colon);
@@ -812,7 +826,7 @@ impl<'a> TokenLexer<'a> {
                         }
                         '0'..='9' => self.consume_number(chars),
                         c if is_id_start(c) => self.consume_id_or_keyword(chars),
-                        '_' => self.consume_wildcard(chars),
+                        '_' => self.consume_ignored(chars),
                         _ => {
                             let result = match self.consume_symbol(remaining) {
                                 Some(result) => result,
@@ -1116,8 +1130,8 @@ mod tests {
                     (Id, Some("ïd_ƒôûr"), 0),
                     (If, None, 0),
                     (Id, Some("iff"), 0),
-                    (Wildcard, Some("_"), 0),
-                    (Wildcard, Some("_foo"), 0),
+                    (Underscore, Some("_"), 0),
+                    (Underscore, Some("_foo"), 0),
                 ],
             );
         }

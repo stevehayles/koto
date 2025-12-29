@@ -1,4 +1,4 @@
-use koto_runtime::{Borrow, Ptr, PtrMut, Result, prelude::*};
+use koto_runtime::{Borrow, PtrMut, Result, prelude::*};
 
 /// Captures output from Koto in a String
 ///
@@ -37,7 +37,7 @@ impl OutputCapture {
     }
 
     /// Returns the currently captured output
-    pub fn captured_output(&self) -> Borrow<String> {
+    pub fn captured_output(&self) -> Borrow<'_, String> {
         self.output.borrow()
     }
 }

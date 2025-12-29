@@ -1,8 +1,8 @@
 //! Adapators used by the `iterator` core library module
 
 use super::collect_pair;
-use crate::{Error, KIteratorOutput as Output, Result, prelude::*};
-use std::{collections::VecDeque, result::Result as StdResult};
+use crate::{Error, ErrorKind, InstructionFrame, KIteratorOutput as Output, Result, prelude::*};
+use std::{collections::VecDeque, mem::take, result::Result as StdResult};
 use thiserror::Error;
 
 /// An iterator that links the output of two iterators together in a chained sequence
@@ -225,12 +225,18 @@ pub struct Each {
     iter: KIterator,
     function: KValue,
     vm: KotoVm,
+    error_frame: InstructionFrame,
 }
 
 impl Each {
     /// Creates a new [Each] adaptor
-    pub fn new(iter: KIterator, function: KValue, vm: KotoVm) -> Self {
-        Self { iter, function, vm }
+    pub fn new(iter: KIterator, function: KValue, vm: &KotoVm) -> Self {
+        Self {
+            iter,
+            function,
+            vm: vm.spawn_shared_vm(),
+            error_frame: vm.instruction_frame(),
+        }
     }
 
     fn map_output(&mut self, output: Output) -> Output {
@@ -242,7 +248,10 @@ impl Each {
         };
         match functor_result {
             Ok(result) => Output::Value(result),
-            Err(error) => Output::Error(error),
+            Err(mut error) => {
+                error.extend_trace(self.error_frame.clone());
+                Output::Error(error)
+            }
         }
     }
 }
@@ -253,6 +262,7 @@ impl KotoIterator for Each {
             iter: self.iter.make_copy()?,
             function: self.function.clone(),
             vm: self.vm.spawn_shared_vm(),
+            error_frame: self.error_frame.clone(),
         };
         Ok(KIterator::new(result))
     }
@@ -325,18 +335,20 @@ impl Iterator for Enumerate {
 
 /// An iterator that flattens the output of nested iterators
 pub struct Flatten {
-    vm: KotoVm,
     iter: KIterator,
     nested: Option<KIterator>,
+    vm: KotoVm,
+    error_frame: InstructionFrame,
 }
 
 impl Flatten {
     /// Creates a new [Flatten] adaptor
-    pub fn new(iter: KIterator, vm: KotoVm) -> Self {
+    pub fn new(iter: KIterator, vm: &KotoVm) -> Self {
         Self {
-            vm,
             iter,
             nested: None,
+            vm: vm.spawn_shared_vm(),
+            error_frame: vm.instruction_frame(),
         }
     }
 }
@@ -344,12 +356,13 @@ impl Flatten {
 impl KotoIterator for Flatten {
     fn make_copy(&self) -> Result<KIterator> {
         let result = Self {
-            vm: self.vm.spawn_shared_vm(),
             iter: self.iter.make_copy()?,
             nested: match &self.nested {
                 Some(nested) => Some(nested.make_copy()?),
                 None => None,
             },
+            vm: self.vm.spawn_shared_vm(),
+            error_frame: self.error_frame.clone(),
         };
         Ok(KIterator::new(result))
     }
@@ -360,10 +373,10 @@ impl Iterator for Flatten {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(nested) = &mut self.nested {
-                if let result @ Some(_) = nested.next() {
-                    return result;
-                }
+            if let Some(nested) = &mut self.nested
+                && let result @ Some(_) = nested.next()
+            {
+                return result;
             }
 
             match self.iter.next().map(collect_pair) {
@@ -373,7 +386,10 @@ impl Iterator for Flatten {
                             self.nested = Some(nested);
                             continue;
                         }
-                        Err(error) => return Some(Output::Error(error)),
+                        Err(mut error) => {
+                            error.extend_trace(self.error_frame.clone());
+                            return Some(Output::Error(error));
+                        }
                     }
                 }
                 other => return other,
@@ -449,17 +465,19 @@ pub struct IntersperseWith {
     next_is_separator: bool,
     separator_function: KValue,
     vm: KotoVm,
+    error_frame: InstructionFrame,
 }
 
 impl IntersperseWith {
     /// Creates a new [IntersperseWith] adaptor
-    pub fn new(iter: KIterator, separator_function: KValue, vm: KotoVm) -> Self {
+    pub fn new(iter: KIterator, separator_function: KValue, vm: &KotoVm) -> Self {
         Self {
             iter,
             peeked: None,
             next_is_separator: false,
             separator_function,
-            vm,
+            vm: vm.spawn_shared_vm(),
+            error_frame: vm.instruction_frame(),
         }
     }
 }
@@ -472,6 +490,7 @@ impl KotoIterator for IntersperseWith {
             next_is_separator: self.next_is_separator,
             separator_function: self.separator_function.clone(),
             vm: self.vm.spawn_shared_vm(),
+            error_frame: self.error_frame.clone(),
         };
         Ok(KIterator::new(result))
     }
@@ -489,7 +508,10 @@ impl Iterator for IntersperseWith {
                 Some(
                     match self.vm.call_function(self.separator_function.clone(), &[]) {
                         Ok(result) => Output::Value(result),
-                        Err(error) => Output::Error(error),
+                        Err(mut error) => {
+                            error.extend_trace(self.error_frame.clone());
+                            Output::Error(error)
+                        }
                     },
                 )
             } else {
@@ -523,15 +545,17 @@ pub struct Keep {
     iter: KIterator,
     predicate: KValue,
     vm: KotoVm,
+    error_frame: InstructionFrame,
 }
 
 impl Keep {
     /// Creates a new [Keep] adaptor
-    pub fn new(iter: KIterator, predicate: KValue, vm: KotoVm) -> Self {
+    pub fn new(iter: KIterator, predicate: KValue, vm: &KotoVm) -> Self {
         Self {
             iter,
             predicate,
-            vm,
+            vm: vm.spawn_shared_vm(),
+            error_frame: vm.instruction_frame(),
         }
     }
 }
@@ -542,6 +566,7 @@ impl KotoIterator for Keep {
             iter: self.iter.make_copy()?,
             predicate: self.predicate.clone(),
             vm: self.vm.spawn_shared_vm(),
+            error_frame: self.error_frame.clone(),
         };
         Ok(KIterator::new(result))
     }
@@ -564,14 +589,20 @@ impl Iterator for Keep {
             let result = match predicate_result {
                 Ok(KValue::Bool(false)) => continue,
                 Ok(KValue::Bool(true)) => output,
-                Ok(unexpected) => Output::Error(
-                    format!(
-                    "iterator.keep: Expected a Bool to be returned from the predicate, found '{}'",
-                    unexpected.type_as_string()
-                )
-                    .into(),
-                ),
-                Err(error) => Output::Error(error),
+                Ok(unexpected) => {
+                    let error = Error::with_error_frame(
+                        ErrorKind::UnexpectedType {
+                            expected: "Bool from the predicate".into(),
+                            unexpected,
+                        },
+                        self.error_frame.clone(),
+                    );
+                    Output::Error(error)
+                }
+                Err(mut error) => {
+                    error.extend_trace(self.error_frame.clone());
+                    Output::Error(error)
+                }
             };
 
             return Some(result);
@@ -705,6 +736,66 @@ impl Iterator for Reversed {
     }
 }
 
+/// An iterator that skips N values from the adapted iterator before yielding all following values
+pub struct Skip {
+    iter: KIterator,
+    remaining: usize,
+}
+
+impl Skip {
+    /// Creates a new [Skip] adaptor
+    pub fn new(iter: KIterator, count: usize) -> Self {
+        Self {
+            iter,
+            remaining: count,
+        }
+    }
+}
+
+impl KotoIterator for Skip {
+    fn make_copy(&self) -> Result<KIterator> {
+        let result = Self {
+            iter: self.iter.make_copy()?,
+            remaining: self.remaining,
+        };
+        Ok(KIterator::new(result))
+    }
+
+    fn is_bidirectional(&self) -> bool {
+        self.iter.is_bidirectional()
+    }
+
+    fn next_back(&mut self) -> Option<Output> {
+        // Ensure the forward output has been skipped before yielding output from the back
+        if self.remaining > 0 {
+            self.iter.nth(self.remaining - 1);
+            self.remaining = 0;
+        }
+
+        self.iter.next_back()
+    }
+}
+
+impl Iterator for Skip {
+    type Item = Output;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining > 0 {
+            self.iter.nth(take(&mut self.remaining))
+        } else {
+            self.iter.next()
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let (lower, upper) = self.iter.size_hint();
+        (
+            lower.saturating_sub(self.remaining),
+            upper.map(|upper| upper.saturating_sub(self.remaining)),
+        )
+    }
+}
+
 /// An error that can be returned by [Reversed::new]
 #[allow(missing_docs)]
 #[derive(Debug, Error)]
@@ -820,16 +911,18 @@ pub struct TakeWhile {
     iter: KIterator,
     predicate: KValue,
     vm: KotoVm,
+    error_frame: InstructionFrame,
     finished: bool,
 }
 
 impl TakeWhile {
     /// Creates a new [Keep] adaptor
-    pub fn new(iter: KIterator, predicate: KValue, vm: KotoVm) -> Self {
+    pub fn new(iter: KIterator, predicate: KValue, vm: &KotoVm) -> Self {
         Self {
             iter,
             predicate,
-            vm,
+            vm: vm.spawn_shared_vm(),
+            error_frame: vm.instruction_frame(),
             finished: false,
         }
     }
@@ -841,6 +934,7 @@ impl KotoIterator for TakeWhile {
             iter: self.iter.make_copy()?,
             predicate: self.predicate.clone(),
             vm: self.vm.spawn_shared_vm(),
+            error_frame: self.error_frame.clone(),
             finished: self.finished,
         };
         Ok(KIterator::new(result))
@@ -871,14 +965,20 @@ impl Iterator for TakeWhile {
                 self.finished = true;
                 return None;
             }
-            Ok(unexpected) => Output::Error(
-                format!(
-                    "expected a Bool to be returned from the predicate, found '{}'",
-                    unexpected.type_as_string()
-                )
-                .into(),
-            ),
-            Err(error) => Output::Error(error),
+            Ok(unexpected) => {
+                let error = Error::with_error_frame(
+                    ErrorKind::UnexpectedType {
+                        expected: "Bool from the predicate".into(),
+                        unexpected,
+                    },
+                    self.error_frame.clone(),
+                );
+                Output::Error(error)
+            }
+            Err(mut error) => {
+                error.extend_trace(self.error_frame.clone());
+                Output::Error(error)
+            }
         };
 
         Some(result)

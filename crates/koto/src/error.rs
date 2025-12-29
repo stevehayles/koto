@@ -6,15 +6,16 @@ use thiserror::Error;
 pub enum Error {
     #[error("{0}")]
     StringError(String),
-    #[error("missing koto module in the prelude")]
-    MissingPrelude,
-    #[error("nothing to run")]
-    NothingToRun,
+    #[error("no exported function named '{0}' found")]
+    MissingFunction(String),
     #[error("{error}")]
     CompileError {
         error: String,
         is_indentation_error: bool,
     },
+    #[cfg(feature = "serde")]
+    #[error(transparent)]
+    SerdeError(#[from] koto_serde::Error),
 }
 
 impl Error {

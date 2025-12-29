@@ -15,18 +15,24 @@ mod send_sync;
 pub use crate::{
     display_context::DisplayContext,
     error::{
-        Error, ErrorFrame, ErrorKind, Result, unexpected_args, unexpected_args_after_instance,
-        unexpected_type,
+        Error, ErrorKind, InstructionFrame, Result, unexpected_args,
+        unexpected_args_after_instance, unexpected_type,
     },
-    io::{BufferedFile, DefaultStderr, DefaultStdin, DefaultStdout, KotoFile, KotoRead, KotoWrite},
+    io::{
+        BufferedFile, KotoFile, KotoRead, KotoWrite, SystemStderr, SystemStdin, SystemStdout,
+        UnavailableStderr, UnavailableStdin, UnavailableStdout,
+    },
     send_sync::{KotoSend, KotoSync},
     types::{
         BinaryOp, CallContext, IsIterable, KFunction, KIterator, KIteratorOutput, KList, KMap,
-        KNativeFunction, KNumber, KObject, KRange, KString, KTuple, KValue, KotoCopy, KotoEntries,
+        KNativeFunction, KNumber, KObject, KRange, KString, KTuple, KValue, KotoAccess, KotoCopy,
         KotoField, KotoFunction, KotoHasher, KotoIterator, KotoObject, KotoType, MetaKey, MetaMap,
-        MethodContext, UnaryOp, ValueKey, ValueMap, ValueVec,
+        MethodContext, ReadOp, UnaryOp, ValueKey, ValueMap, ValueVec, WriteOp,
     },
     vm::{CallArgs, KotoVm, KotoVmSettings, ModuleImportedCallback, ReturnOrYield},
 };
 pub use koto_derive as derive;
-pub use koto_memory::{Borrow, BorrowMut, KCell, Ptr, PtrMut, make_ptr, make_ptr_mut};
+pub use koto_memory::{Borrow, BorrowMut, KCell, Ptr, PtrMut, lazy, make_ptr, make_ptr_mut};
+
+#[doc(hidden)]
+pub mod __private;

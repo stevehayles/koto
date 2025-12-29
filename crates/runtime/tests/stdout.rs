@@ -81,9 +81,65 @@ Hello from @display
     }
 
     #[test]
+    fn debug_map_no_type() {
+        let script = "
+foo = {}
+debug foo
+";
+
+        check_logged_output(script, "[3] foo: {}\n");
+    }
+
+    #[test]
+    fn debug_map_with_meta_no_type() {
+        let script = "
+foo =
+  @meta bar: 'Foo'
+debug foo
+";
+
+        check_logged_output(script, "[4] foo: {}\n");
+    }
+
+    #[test]
+    fn debug_with_type() {
+        let script = "
+foo =
+  @type: 'Foo'
+debug foo
+";
+
+        check_logged_output(script, "[4] foo: Foo {}\n");
+    }
+
+    #[test]
+    fn debug_with_overridden_display() {
+        let script = "
+foo =
+  @type: 'Foo'
+  @display: || 'Display Foo'
+debug foo
+";
+
+        check_logged_output(script, "[5] foo: Display Foo\n");
+    }
+
+    #[test]
+    fn debug_with_overridden_debug() {
+        let script = "
+foo =
+  @type: 'Foo'
+  @debug: || 'Debug Foo'
+debug foo
+";
+
+        check_logged_output(script, "[5] foo: Debug Foo\n");
+    }
+
+    #[test]
     fn write_via_stdout() {
         let script = "
-stdout = io.stdout()
+stdout = io.stdout
 stdout.write 'abc'
 stdout.write 'def'
 stdout.write_line 'ghi'
@@ -95,7 +151,7 @@ stdout.write_line 'ghi'
     #[test]
     fn write_via_stderr() {
         let script = "
-stderr = io.stderr()
+stderr = io.stderr
 stderr.write '123'
 stderr.write '456'
 stderr.write_line '789'

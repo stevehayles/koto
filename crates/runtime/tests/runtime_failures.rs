@@ -3,18 +3,26 @@
 mod runtime {
     use koto_bytecode::{CompilerSettings, ModuleLoader};
     use koto_lexer::{Position, Span};
-    use koto_runtime::{ErrorFrame, KotoVm};
+    use koto_runtime::{InstructionFrame, KotoVm};
     use koto_test_utils::script_instructions;
 
     fn check_script_fails(script: &str) {
-        check_that_script_fails(script, None);
+        check_that_script_fails(script, None, None);
     }
 
     fn check_script_fails_with_span(script: &str, span: Span) {
-        check_that_script_fails(script, Some(span))
+        check_that_script_fails(script, None, Some(span))
     }
 
-    fn check_that_script_fails(script: &str, span: Option<Span>) {
+    fn check_script_fails_with_error_span(script: &str, error: impl Into<String>, span: Span) {
+        check_that_script_fails(script, Some(error.into()), Some(span))
+    }
+
+    fn check_script_fails_with_error(script: &str, error: impl Into<String>) {
+        check_that_script_fails(script, Some(error.into()), None)
+    }
+
+    fn check_that_script_fails(script: &str, message: Option<String>, span: Option<Span>) {
         let mut vm = KotoVm::default();
 
         let mut loader = ModuleLoader::default();
@@ -35,8 +43,12 @@ mod runtime {
                 )
             }
             Err(e) => {
+                if let Some(expected_message) = message {
+                    assert_eq!(expected_message, e.error.to_string());
+                }
+
                 if let Some(expected_span) = span {
-                    let ErrorFrame { chunk, instruction } = e.trace.first().unwrap();
+                    let InstructionFrame { chunk, instruction } = e.trace.first().unwrap();
                     let error_span = chunk.debug_info.get_source_span(*instruction).unwrap();
                     if error_span != expected_span {
                         println!("{}", script_instructions(script, vm.chunk()));
@@ -159,7 +171,7 @@ let foo: Iterable? = true
             }
 
             #[test]
-            fn wildcard_expected_bool() {
+            fn ignored_id_expected_bool() {
                 let script = "\
 let _foo: Bool = 'abc'
 #   ^^^^
@@ -174,7 +186,7 @@ let _foo: Bool = 'abc'
             }
 
             #[test]
-            fn wildcard_expected_string_in_multi_assignment() {
+            fn ignored_id_expected_string_in_multi_assignment() {
                 let script = "\
 let _x: String, y: Bool = 99, true
 #   ^^
@@ -221,7 +233,7 @@ f ('hello',)
             }
 
             #[test]
-            fn wildcard_arg_with_type() {
+            fn ignored_arg_with_type() {
                 let script = "\
 f = |_x: List| true
 #    ^^
@@ -237,7 +249,7 @@ f 'hello'
             }
 
             #[test]
-            fn nested_wildcard_arg_with_type() {
+            fn nested_ignored_arg_with_type() {
                 let script = "\
 f = |(_x: Bool)| true
 #     ^^
@@ -290,6 +302,50 @@ f 42
             }
 
             #[test]
+            fn function_with_map_arg() {
+                let script = "\
+f = |{x, y}: Foo|
+#    ^^^^^^
+  x + y
+
+f {x: 1, y: 2, @type: 'Bar'}
+";
+                check_script_fails_with_error_span(
+                    script,
+                    "expected Foo, found Bar",
+                    Span {
+                        start: Position { line: 0, column: 5 },
+                        end: Position {
+                            line: 0,
+                            column: 11,
+                        },
+                    },
+                );
+            }
+
+            #[test]
+            fn function_with_map_arg_entry() {
+                let script = "\
+f = |{number: Number}|
+#     ^^^^^^
+  number
+
+f {number: 'not a number'}
+";
+                check_script_fails_with_error_span(
+                    script,
+                    "expected Number, found String",
+                    Span {
+                        start: Position { line: 0, column: 6 },
+                        end: Position {
+                            line: 0,
+                            column: 12,
+                        },
+                    },
+                );
+            }
+
+            #[test]
             fn for_loop_with_typed_arg() {
                 let script = "\
 for foo: Number in (1, true, 2)
@@ -306,7 +362,7 @@ for foo: Number in (1, true, 2)
             }
 
             #[test]
-            fn for_loop_with_typed_wildcard_arg() {
+            fn for_loop_with_typed_ignored_arg() {
                 let script = "\
 for _foo: Number in (1, true, 2)
 #   ^^^^
@@ -344,7 +400,7 @@ for i: Number, x: Bool in 'abc'.enumerate()
             }
 
             #[test]
-            fn for_loop_with_typed_unpacked_wildcard_arg() {
+            fn for_loop_with_typed_unpacked_ignored_arg() {
                 let script = "\
 for i: Number, _x: Bool in 'abc'.enumerate()
 #              ^^
@@ -386,6 +442,38 @@ g().consume()
                     },
                 );
             }
+
+            #[test]
+            fn let_map() {
+                let script = "\
+let {abc}: Foo = {@type: 'Bar', abc: 123}
+#   ^^^^^
+";
+                check_script_fails_with_error_span(
+                    script,
+                    "expected Foo, found Bar",
+                    Span {
+                        start: Position { line: 0, column: 4 },
+                        end: Position { line: 0, column: 9 },
+                    },
+                );
+            }
+
+            #[test]
+            fn let_map_key() {
+                let script = "\
+let {abc: String} = {abc: 123}
+#    ^^^
+";
+                check_script_fails_with_error_span(
+                    script,
+                    "expected String, found Number",
+                    Span {
+                        start: Position { line: 0, column: 5 },
+                        end: Position { line: 0, column: 8 },
+                    },
+                );
+            }
         }
 
         mod missing_values {
@@ -421,7 +509,29 @@ x
             use super::*;
 
             #[test]
-            fn iterator_consume_should_propagate_error() {
+            fn advance_should_propagate_error() {
+                let script = "\
+g = ||
+  yield 1
+  assert false
+# ^^^^^^^^^^^^
+
+g().advance 2
+";
+                check_script_fails_with_span(
+                    script,
+                    Span {
+                        start: Position { line: 2, column: 2 },
+                        end: Position {
+                            line: 2,
+                            column: 14,
+                        },
+                    },
+                );
+            }
+
+            #[test]
+            fn consume_should_propagate_error() {
                 let script = "\
 (1..5)
   .each |_| assert false
@@ -444,7 +554,7 @@ x
             }
 
             #[test]
-            fn iterator_count_should_propagate_error() {
+            fn count_should_propagate_error() {
                 let script = "\
 (1..5)
   .each |_| assert false
@@ -467,7 +577,7 @@ x
             }
 
             #[test]
-            fn iterator_generate_used_as_instance_function() {
+            fn generate_used_as_instance_function() {
                 let script = "
 [].generate(|| true).take(3).to_list()
 ";
@@ -475,11 +585,83 @@ x
             }
 
             #[test]
-            fn iterator_repeat_used_as_instance_function() {
+            fn keep_function_missing_argument() {
+                let script = "\
+(1..10).keep(|| false).to_tuple()
+#       ^^^^
+";
+                check_script_fails_with_span(
+                    script,
+                    Span {
+                        start: Position { line: 0, column: 8 },
+                        end: Position {
+                            line: 0,
+                            column: 12,
+                        },
+                    },
+                );
+            }
+
+            #[test]
+            fn keep_function_returns_non_bool() {
+                let script = "\
+(1..10).keep(|x| null).to_tuple()
+#       ^^^^
+";
+                check_script_fails_with_span(
+                    script,
+                    Span {
+                        start: Position { line: 0, column: 8 },
+                        end: Position {
+                            line: 0,
+                            column: 12,
+                        },
+                    },
+                );
+            }
+
+            #[test]
+            fn repeat_used_as_instance_function() {
                 let script = "
 [1, 2, 3].repeat(3).to_list()
 ";
                 check_script_fails(script);
+            }
+
+            #[test]
+            fn string_split_function_missing_argument() {
+                let script = "\
+'abc'.split(|| false).to_tuple()
+#     ^^^^^
+";
+                check_script_fails_with_span(
+                    script,
+                    Span {
+                        start: Position { line: 0, column: 6 },
+                        end: Position {
+                            line: 0,
+                            column: 11,
+                        },
+                    },
+                );
+            }
+
+            #[test]
+            fn string_split_function_returns_non_bool() {
+                let script = "\
+'abc'.split(|c| null).to_tuple()
+#     ^^^^^
+";
+                check_script_fails_with_span(
+                    script,
+                    Span {
+                        start: Position { line: 0, column: 6 },
+                        end: Position {
+                            line: 0,
+                            column: 11,
+                        },
+                    },
+                );
             }
 
             #[test]
@@ -583,10 +765,19 @@ f x...
             use super::*;
 
             #[test]
-            fn index_out_of_bounds() {
+            fn index_out_of_bounds_list() {
                 let script = "
 x = [0, 1, 2]
 x[3] = 3
+";
+                check_script_fails(script);
+            }
+
+            #[test]
+            fn index_out_of_bounds_range() {
+                let script = "
+x = 10..20
+x[100]
 ";
                 check_script_fails(script);
             }
@@ -697,6 +888,35 @@ x.reversed().next()
             }
         }
 
+        mod export {
+            use super::*;
+
+            #[test]
+            fn export_single_value() {
+                let script = "
+export 99
+";
+                check_script_fails(script);
+            }
+
+            #[test]
+            fn export_list() {
+                let script = "
+x = [1, 2, 3]
+export x
+";
+                check_script_fails(script);
+            }
+
+            #[test]
+            fn export_iterator_with_non_key_pair_output() {
+                let script = "
+export (1..=3).each |i| i, i, i
+";
+                check_script_fails(script);
+            }
+        }
+
         mod strings {
             use super::*;
 
@@ -733,6 +953,57 @@ x = r###########################################################################
                         end: Position { line: 1, column: 7 },
                     },
                 )
+            }
+        }
+
+        mod import {
+            use super::*;
+
+            #[test]
+            fn import_unknown_module() {
+                let script = "
+import abcxyz
+";
+                check_script_fails(script);
+            }
+
+            #[test]
+            fn wildcard_import_after_function() {
+                let script = "
+f = |x| abs x
+from number import *
+f -1
+";
+                check_script_fails(script);
+            }
+
+            #[test]
+            fn wildcard_import_after_nested_function() {
+                let script = "
+f = |x|
+  g = |x| abs x
+  from number import *
+  g x
+
+f -1
+";
+                check_script_fails(script);
+            }
+        }
+
+        mod stdio {
+            use super::*;
+
+            #[test]
+            fn unavailable_by_default() {
+                // We're just calling `flush`, but whatever File method you call,
+                // the error is the same.
+                check_script_fails_with_error("io.stdin.flush()", "stdin is unavailable");
+                check_script_fails_with_error("io.stdout.flush()", "stdout is unavailable");
+                check_script_fails_with_error("io.stderr.flush()", "stderr is unavailable");
+
+                // `print` uses stdout
+                check_script_fails_with_error("print 'test'", "stdout is unavailable");
             }
         }
     }

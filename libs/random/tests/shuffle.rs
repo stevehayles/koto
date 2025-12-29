@@ -4,6 +4,7 @@ use koto_test_utils::*;
 use std::{error::Error, fs, path::PathBuf, result::Result as StdResult};
 
 #[derive(Clone, Debug, Default, KotoCopy, KotoType)]
+#[koto(runtime = koto_runtime)]
 struct TestContainer {
     data: Vec<KValue>,
 }
@@ -16,8 +17,8 @@ impl TestContainer {
     }
 
     #[koto_method]
-    fn to_tuple(&self) -> KValue {
-        KTuple::from(self.data.clone()).into()
+    fn to_tuple(&self) -> KTuple {
+        self.data.clone().into()
     }
 }
 
@@ -33,7 +34,7 @@ impl KotoObject for TestContainer {
         }
     }
 
-    fn index_mut(&mut self, index: &KValue, value: &KValue) -> Result<()> {
+    fn index_assign(&mut self, index: &KValue, value: &KValue) -> Result<()> {
         match index {
             KValue::Number(i) => {
                 self.data[usize::from(i)] = value.clone();

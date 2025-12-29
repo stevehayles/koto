@@ -45,11 +45,17 @@ pub enum Instruction {
         register: u8,
         constant: ConstantIndex,
     },
-    ValueExport {
-        name: u8,
+    ExportValue {
+        key: u8,
         value: u8,
     },
+    ExportEntry {
+        entry: u8,
+    },
     Import {
+        register: u8,
+    },
+    ImportAll {
         register: u8,
     },
     MakeTempTuple {
@@ -156,6 +162,11 @@ pub enum Instruction {
         lhs: u8,
         rhs: u8,
     },
+    Power {
+        register: u8,
+        lhs: u8,
+        rhs: u8,
+    },
     AddAssign {
         lhs: u8,
         rhs: u8,
@@ -173,6 +184,10 @@ pub enum Instruction {
         rhs: u8,
     },
     RemainderAssign {
+        lhs: u8,
+        rhs: u8,
+    },
+    PowerAssign {
         lhs: u8,
         rhs: u8,
     },
@@ -283,11 +298,6 @@ pub enum Instruction {
         index: u8,
         value: u8,
     },
-    MapInsert {
-        register: u8,
-        key: u8,
-        value: u8,
-    },
     MetaInsert {
         register: u8,
         value: u8,
@@ -313,10 +323,27 @@ pub enum Instruction {
         value: u8,
         key: ConstantIndex,
     },
+    TryAccess {
+        register: u8,
+        value: u8,
+        key: ConstantIndex,
+        jump_offset: u16,
+    },
     AccessString {
         register: u8,
         value: u8,
         key: u8,
+    },
+    TryAccessString {
+        register: u8,
+        value: u8,
+        key: u8,
+        jump_offset: u16,
+    },
+    AccessAssign {
+        register: u8,
+        key: u8,
+        value: u8,
     },
     TryStart {
         arg_register: u8,
@@ -367,9 +394,15 @@ impl FunctionFlags {
     const VARIADIC: u8 = 1 << 0;
     const GENERATOR: u8 = 1 << 1;
     const ARG_IS_UNPACKED_TUPLE: u8 = 1 << 2;
+    const NON_LOCAL_ACCESS: u8 = 1 << 3;
 
     /// Returns a new [FunctionFlags] with the given flags set
-    pub fn new(variadic: bool, generator: bool, arg_is_unpacked_tuple: bool) -> Self {
+    pub fn new(
+        variadic: bool,
+        generator: bool,
+        arg_is_unpacked_tuple: bool,
+        non_local_access: bool,
+    ) -> Self {
         let mut flags = 0;
         if variadic {
             flags |= Self::VARIADIC;
@@ -379,6 +412,9 @@ impl FunctionFlags {
         }
         if arg_is_unpacked_tuple {
             flags |= Self::ARG_IS_UNPACKED_TUPLE;
+        }
+        if non_local_access {
+            flags |= Self::NON_LOCAL_ACCESS;
         }
         Self(flags)
     }
@@ -407,13 +443,22 @@ impl FunctionFlags {
     pub fn arg_is_unpacked_tuple(self) -> bool {
         self.0 & Self::ARG_IS_UNPACKED_TUPLE != 0
     }
+
+    /// True if the function accesses a non-local value
+    ///
+    /// Functions that access a non-local value need to carry module exports and wildcard imports
+    /// with them, if no non-locals are accessed then the creation of the non-local context can be
+    /// skipped.
+    pub fn non_local_access(self) -> bool {
+        self.0 & Self::NON_LOCAL_ACCESS != 0
+    }
 }
 
 impl TryFrom<u8> for FunctionFlags {
     type Error = String;
 
     fn try_from(byte: u8) -> Result<Self, Self::Error> {
-        if byte <= 0b111 {
+        if byte <= 0b1111 {
             Ok(Self(byte))
         } else {
             Err(format!("Invalid function flags: {byte:#010b}"))
@@ -561,10 +606,12 @@ impl fmt::Debug for Instruction {
                     "LoadNonLocal    result: {register:<7} constant: {constant}"
                 )
             }
-            ValueExport { name, value } => {
-                write!(f, "ValueExport     name: {name:<7} value: {value}")
+            ExportValue { key, value } => {
+                write!(f, "ExportValue     key: {key:<10} value: {value}")
             }
+            ExportEntry { entry } => write!(f, "ExportEntry     entry: {entry}"),
             Import { register } => write!(f, "Import          register: {register}"),
+            ImportAll { register } => write!(f, "ImportAll       register: {register}"),
             MakeTempTuple {
                 register,
                 start,
@@ -681,6 +728,12 @@ impl fmt::Debug for Instruction {
                     "Remainder       result: {register:<7} lhs: {lhs:<10} rhs: {rhs}"
                 )
             }
+            Power { register, lhs, rhs } => {
+                write!(
+                    f,
+                    "Power           result: {register:<7} lhs: {lhs:<10} rhs: {rhs}"
+                )
+            }
             AddAssign { lhs, rhs } => {
                 write!(f, "AddAssign       lhs: {lhs:<10} rhs: {rhs}")
             }
@@ -695,6 +748,9 @@ impl fmt::Debug for Instruction {
             }
             RemainderAssign { lhs, rhs } => {
                 write!(f, "RemAssign       lhs: {lhs:<10} rhs: {rhs}")
+            }
+            PowerAssign { lhs, rhs } => {
+                write!(f, "PowAssign       lhs: {lhs:<10} rhs: {rhs}")
             }
             Less { register, lhs, rhs } => {
                 write!(
@@ -832,13 +888,13 @@ impl fmt::Debug for Instruction {
                 f,
                 "IndexMut        register: {register:<5} index: {index:<8} value: {value}"
             ),
-            MapInsert {
+            AccessAssign {
                 register,
                 value,
                 key,
             } => write!(
                 f,
-                "MapInsert       map: {register:<10} value: {value:<8} key: {key}"
+                "AccessAssign    register: {register:<5} value: {value:<8} key: {key}"
             ),
             MetaInsert {
                 register,
@@ -879,6 +935,15 @@ impl fmt::Debug for Instruction {
                 f,
                 "Access          result: {register:<7} source: {value:<7} key: {key}"
             ),
+            TryAccess {
+                register,
+                value,
+                key,
+                jump_offset,
+            } => write!(
+                f,
+                "TryAccess       result: {register:<7} source: {value:<7} key: {key} offset: {jump_offset}"
+            ),
             AccessString {
                 register,
                 value,
@@ -886,6 +951,15 @@ impl fmt::Debug for Instruction {
             } => write!(
                 f,
                 "AccessString    result: {register:<7} source: {value:<7} key: {key}"
+            ),
+            TryAccessString {
+                register,
+                value,
+                key,
+                jump_offset,
+            } => write!(
+                f,
+                "TryAccessString result: {register:<7} source: {value:<7} key: {key} offset: {jump_offset}"
             ),
             TryStart {
                 arg_register,
@@ -914,7 +988,8 @@ impl fmt::Debug for Instruction {
             } => {
                 write!(
                     f,
-                    "AssertType      value: {value:7} type: {type_string:<8} allow null: {allow_null}"
+                    "AssertType      value: {value:<8} type: {type_string:<9} \
+                     allow null: {allow_null}"
                 )
             }
             CheckType {
@@ -925,8 +1000,8 @@ impl fmt::Debug for Instruction {
             } => {
                 write!(
                     f,
-                    "CheckType       value: {value:7} type: {type_string:<8} allow null: {allow_null:<6}\
-                    offset: {jump_offset}"
+                    "CheckType       value: {value:<7} type: {type_string:<8} \
+                    allow null: {allow_null:<6} offset: {jump_offset}"
                 )
             }
             StringStart { size_hint } => {

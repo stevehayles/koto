@@ -183,11 +183,13 @@ impl Iterator for InstructionReader {
                 register: byte_a,
                 constant: get_var_u32!().into(),
             },
-            Op::ValueExport => ValueExport {
-                name: byte_a,
+            Op::ExportValue => ExportValue {
+                key: byte_a,
                 value: get_u8!(),
             },
+            Op::ExportEntry => ExportEntry { entry: byte_a },
             Op::Import => Import { register: byte_a },
+            Op::ImportAll => ImportAll { register: byte_a },
             Op::MakeTempTuple => {
                 let [byte_b, byte_c] = get_u8x2!();
                 MakeTempTuple {
@@ -329,6 +331,14 @@ impl Iterator for InstructionReader {
                     rhs: byte_c,
                 }
             }
+            Op::Power => {
+                let [byte_b, byte_c] = get_u8x2!();
+                Power {
+                    register: byte_a,
+                    lhs: byte_b,
+                    rhs: byte_c,
+                }
+            }
             Op::AddAssign => AddAssign {
                 lhs: byte_a,
                 rhs: get_u8!(),
@@ -346,6 +356,10 @@ impl Iterator for InstructionReader {
                 rhs: get_u8!(),
             },
             Op::RemainderAssign => RemainderAssign {
+                lhs: byte_a,
+                rhs: get_u8!(),
+            },
+            Op::PowerAssign => PowerAssign {
                 lhs: byte_a,
                 rhs: get_u8!(),
             },
@@ -511,7 +525,7 @@ impl Iterator for InstructionReader {
                     index,
                 }
             }
-            Op::IndexMut => {
+            Op::IndexAssign => {
                 let [index, value] = get_u8x2!();
                 IndexMut {
                     register: byte_a,
@@ -519,9 +533,9 @@ impl Iterator for InstructionReader {
                     value,
                 }
             }
-            Op::MapInsert => {
+            Op::AccessAssign => {
                 let [key, value] = get_u8x2!();
-                MapInsert {
+                AccessAssign {
                     register: byte_a,
                     key,
                     value,
@@ -598,12 +612,30 @@ impl Iterator for InstructionReader {
                     key: get_var_u32_with_first_byte!(key_a).into(),
                 }
             }
+            Op::TryAccess => {
+                let [value, key_a] = get_u8x2!();
+                TryAccess {
+                    register: byte_a,
+                    value,
+                    key: get_var_u32_with_first_byte!(key_a).into(),
+                    jump_offset: get_u16!(),
+                }
+            }
             Op::AccessString => {
                 let [byte_b, byte_c] = get_u8x2!();
                 AccessString {
                     register: byte_a,
                     value: byte_b,
                     key: byte_c,
+                }
+            }
+            Op::TryAccessString => {
+                let [byte_b, byte_c] = get_u8x2!();
+                TryAccessString {
+                    register: byte_a,
+                    value: byte_b,
+                    key: byte_c,
+                    jump_offset: get_u16!(),
                 }
             }
             Op::TryStart => TryStart {

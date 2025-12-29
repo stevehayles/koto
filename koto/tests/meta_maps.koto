@@ -8,12 +8,39 @@ foo = |x|
 # Declaring the overridden operators once and then cloning the meta map into the foo
 # instance is more efficient than declaring them each time foo is called.
 globals.foo_meta =
-  # Arithmetic operators
-  @+: |other| foo self.x + other.x
-  @-: |other| foo self.x - other.x
-  @*: |other| foo self.x * other.x
-  @/: |other| foo self.x / other.x
-  @%: |other| foo self.x % other.x
+  # Arithmetic operators for when self is on the LHS
+  @+: |other|
+    match other
+      _: Foo then foo self.x + other.x
+      _: Number then foo self.x + other
+  @-: |other|
+    match other
+      _: Foo then foo self.x - other.x
+      _: Number then foo self.x - other
+  @*: |other|
+    match other
+      _: Foo then foo self.x * other.x
+      _: Number then foo self.x * other
+  @/: |other|
+    match other
+      _: Foo then foo self.x / other.x
+      _: Number then foo self.x / other
+  @%: |other|
+    match other
+      _: Foo then foo self.x % other.x
+      _: Number then foo self.x % other
+  @^: |other|
+    match other
+      _: Foo then foo self.x ^ other.x
+      _: Number then foo self.x ^ other
+
+  # Arithmetic operators for when self is on the RHS
+  @r+: |other| foo other + self.x
+  @r-: |other| foo other - self.x
+  @r*: |other| foo other * self.x
+  @r/: |other| foo other / self.x
+  @r%: |other| foo other % self.x
+  @r^: |other| foo other ^ self.x
 
   # Compound assignment operators
   @+=: |other|
@@ -31,14 +58,19 @@ globals.foo_meta =
   @%=: |other|
     self.x %= other
     self
+  @^=: |other|
+    self.x ^= other
+    self
 
   # Comparison operators
   @<: |other| self.x < other.x
-  @<=: |other| self.x <= other.x
-  @>: |other| self.x > other.x
-  @>=: |other| self.x >= other.x
   @==: |other| self.x == other.x
-  @!=: |other| not self == other
+
+  # The remaining comparison operators are derived from @< and @== by default. 
+  # @<=: |other| self.x <= other.x
+  # @>: |other| self.x > other.x
+  # @>=: |other| self.x >= other.x
+  # @!=: |other| not self == other
 
   # Negation (e.g. -foo)
   @negate: || foo -self.x
@@ -53,8 +85,8 @@ globals.foo_meta =
     index
   @size: || self.x
 
-  @index_mut: |index, value|
-    throw '@index_mut is unsupported for this object type (index: {index}, value: {value}})'
+  @index_assign: |index, value|
+    throw '@index_assign is unsupported for this object type (index: {index}, value: {value}})'
 
   # Custom iteration
   # @iterator must be a function that returns an iterable value,
@@ -94,18 +126,27 @@ globals.foo_meta =
 export
   @test add: ||
     assert_eq (foo(10) + foo(20)), foo 30
+    assert_eq (1 + foo(2)), foo 3
 
   @test subtract: ||
     assert_eq (foo(99) - foo(100)), foo -1
+    assert_eq (101 - foo(100)), foo 1
 
   @test multiply: ||
     assert_eq (foo(6) * foo(7)), foo 42
+    assert_eq (11 * foo(3)), foo 33
 
   @test divide: ||
     assert_eq (foo(42) / foo(2)), foo 21
+    assert_eq (10 / foo(5)), foo 2
 
   @test remainder: ||
     assert_eq (foo(42) % foo(10)), foo 2
+    assert_eq (10 % foo(3)), foo 1
+
+  @test power: ||
+    assert_eq (foo(2) ^ foo(4)), foo 16
+    assert_eq (10 ^ foo(2)), foo 100
 
   @test add_assign: ||
     assert_eq (foo(10) += 20), foo 30
@@ -121,6 +162,9 @@ export
 
   @test remainder_assign: ||
     assert_eq (foo(42) %= 10), foo 2
+
+  @test power_assign: ||
+    assert_eq (foo(4) ^= 3), foo 64
 
   @test less: ||
     assert foo(5) < foo(6)
@@ -165,10 +209,10 @@ export
     assert_eq (size foo(10)), 10
     assert_eq (size foo(99)), 99
 
-  @test index_mut: ||
+  @test index_assign: ||
     expection_caught = false
 
-    try 
+    try
       foo(100)[1] = 42
     catch error
       assert error.contains '(index: 1, value: 42})'

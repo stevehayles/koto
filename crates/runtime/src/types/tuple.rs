@@ -1,4 +1,4 @@
-use crate::{Ptr, Result, prelude::*};
+use crate::{Ptr, Result, lazy, prelude::*};
 use std::ops::{Deref, Range};
 
 /// The Tuple type used by the Koto runtime
@@ -38,6 +38,11 @@ impl KTuple {
         } else {
             None
         }
+    }
+
+    /// Returns the tuple's values as a slice
+    pub fn data(&self) -> &[KValue] {
+        self.deref()
     }
 
     /// Returns true if the tuple contains only immutable values
@@ -117,6 +122,23 @@ impl KTuple {
         }
     }
 
+    /// Returns true if the tuples refer to the same underlying data and have the same bounds
+    pub fn is_same_instance(&self, other: &Self) -> bool {
+        let ptr_and_bounds = |tuple: &Self| match &tuple.0 {
+            Inner::Full(data) => (Ptr::address(data), 0..data.len()),
+            Inner::Slice(slice) => (
+                Ptr::address(&slice.data),
+                slice.bounds.start as usize..slice.bounds.end as usize,
+            ),
+            Inner::SliceLarge(slice) => (Ptr::address(&slice.data), slice.bounds.clone()),
+        };
+
+        let (ptr_a, bounds_a) = ptr_and_bounds(self);
+        let (ptr_b, bounds_b) = ptr_and_bounds(other);
+
+        ptr_a == ptr_b && bounds_a == bounds_b
+    }
+
     /// Renders the tuple into the provided display context
     pub fn display(&self, ctx: &mut DisplayContext) -> Result<()> {
         let id = Ptr::address(match &self.0 {
@@ -153,13 +175,9 @@ impl Deref for KTuple {
     }
 }
 
-thread_local! {
-    static EMPTY_TUPLE: Ptr<Vec<KValue>> = Vec::new().into();
-}
-
 impl Default for KTuple {
     fn default() -> Self {
-        Self::from(EMPTY_TUPLE.with(|x| x.clone()))
+        Self::from(lazy!(Ptr<Vec<KValue>>; Vec::new()))
     }
 }
 

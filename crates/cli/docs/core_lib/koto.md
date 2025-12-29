@@ -2,43 +2,20 @@
 
 A collection of utilities for working with the Koto runtime.
 
-## args
-
-```kototype
-Tuple
-```
-
-Provides access to the arguments that were passed into the script when running
-the `koto` CLI application.
-
-If no arguments were provided then the list is empty.
-
-### Example
-
-```koto
-# Assuming that the script was run with `koto script.koto -- 1 2 "hello"`
-size koto.args
-# 3
-koto.args.first()
-# 1
-koto.args.last()
-# hello
-```
-
 ## copy
 
 ```kototype
 |value: Any| -> Any
 ```
 
-Makes a copy of the provided value. 
+Makes a copy of the provided value.
 
 ### Shared mutable data
 
 For values that have shared mutable data (i.e., `List`, `Map`), unique copies of
 the data will be made. Note that this only applies to the first level of data,
 so nested containers will still share their data with their counterparts in the
-original data. To make a copy where any nested containers are also unique, 
+original data. To make a copy where any nested containers are also unique,
 use [`koto.deep_copy`](#deep-copy).
 
 ### Iterator copies
@@ -126,29 +103,6 @@ check! [[1, 2], [3, [4, 5]]]
 - [`koto.copy`](#copy)
 
 
-## exports
-
-```kototype
-|| -> Map
-```
-
-Returns the current module's `export` map.
-
-Although typically module items are exported with `export` expressions,
-it can be useful to export items programatically.
-
-### Example
-
-```koto
-export a, b, c = 1, 2, 3
-print! koto.exports()
-check! {a: 1, b: 2, c: 3}
-
-koto.exports().remove 'b'
-print! koto.exports()
-check! {a: 1, c: 3}
-```
-
 ## hash
 
 ```kototype
@@ -166,10 +120,10 @@ print! (hash 'hi') == (hash 'bye')
 check! false
 
 # Lists aren't hashable
-print! hash [1, 2] 
+print! hash [1, 2]
 check! null
 
-# Tuples are hashable if they only contain hashable values 
+# Tuples are hashable if they only contain hashable values
 print! (hash (1, 2)) == null
 check! false
 ```
@@ -253,10 +207,10 @@ The size of a value is typically defined as the number of elements in a
 container, with some notable exceptions:
 
 - For strings, the size is the number of bytes in the string data.
-- For ranges, the size is the number of integers in the range. 
-  - For non-inclusive ranges, this is equivalent to 
+- For ranges, the size is the number of integers in the range.
+  - For non-inclusive ranges, this is equivalent to
     `range.end() - range.start()`.
-  - For inclusive ranges, this is equivalent to 
+  - For inclusive ranges, this is equivalent to
     `range.end() + 1 - range.start()`.
   - If the range is unbounded then an error will be thrown.
 - An error will be thrown if the value doesn't have a defined size.
@@ -300,3 +254,46 @@ foo =
 print! koto.type foo
 check! Foo
 ```
+
+
+## unimplemented
+
+```kototype
+Unimplemented
+```
+
+An instance of `Unimplemented`, which should be thrown from [overridden arithmetic operators][guide-arithmetic] when the
+operation isn't supported with the given input type.
+
+### Example
+
+```koto
+foo = |n|
+  data: n
+  @type: 'Foo'
+  @display: || 'Foo({self.data})'
+  @+: |other|
+    # Throw an `unimplemented` error if the rhs isn't a Foo
+    match type other
+      'Foo' then foo self.data + other.data
+      else throw koto.unimplemented
+
+bar = |n|
+  data: n
+  @type: 'Bar'
+  @display: || 'Bar({self.data})'
+  @r+: |other|
+
+    match type other
+      'Foo' or 'Bar' then bar other.data + self.data
+      else throw koto.unimplemented
+
+print! (foo 10) + (foo 20)
+check! Foo(30)
+
+print! (foo 2) + (bar 3)
+check! Bar(5)
+```
+
+
+[guide-arithmetic]: ../language_guide.md#arithmetic-operators

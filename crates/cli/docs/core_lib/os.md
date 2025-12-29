@@ -2,6 +2,44 @@
 
 A collection of utilities for working with the operating system.
 
+## args
+
+```kototype
+Tuple
+```
+
+Provides access to the arguments that were passed into the script when running
+the `koto` CLI application.
+
+If no arguments were provided then the list is empty.
+
+### Example
+
+```koto
+# Assuming that the script was run with `koto script.koto -- 1 2 "hello"`
+size os.args
+# 3
+os.args.first()
+# 1
+os.args.last()
+# hello
+```
+
+## env
+
+```kototype
+|String| -> String?
+```
+
+Returns the environment variable with the given name, or `null` if the name contains '=', '\0', the variable is unset, or its value is not valid Unicode.
+
+### Example
+
+```koto,skip_run
+user = os.env("USERNAME") or "world"
+print "Hello, {user}!"
+```
+
 ## command
 
 ```kototype
@@ -54,10 +92,10 @@ script is running.
 t = os.start_timer()
 
 # ...after some time...
-print "Time taken: ${t.elapsed()}s"
+print "Time taken: {t.elapsed()}s"
 
 t2 = os.start_timer()
-print "Seconds between then and now: ${t2 - t}"
+print "Seconds between then and now: {t2 - t}"
 ```
 
 ## time
@@ -529,5 +567,5 @@ Returns the number of seconds that have elapsed since the timer was started.
 t = os.start_timer()
 
 # ...after some time...
-print "Time taken: ${t.elapsed()}s"
+print "Time taken: {t.elapsed()}s"
 ```

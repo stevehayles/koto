@@ -89,11 +89,19 @@ pub enum Op {
 
     /// Imports a value
     ///
-    /// The name of the value to be imported will be placed in the register before running this op,
-    /// the imported value will then be placed in the same register.
+    /// The name of the module to be imported will be placed in the register before running this op,
+    /// the imported module will then be placed in the same register.
     ///
     /// `[*register]`
     Import,
+
+    /// Imports all items from a value
+    ///
+    /// The name of the module to be imported will be placed in the register before running this op,
+    /// the imported module will then be made available for non-local access within the module.
+    ///
+    /// `[*register]`
+    ImportAll,
 
     /// Makes a temporary tuple out of values stored in consecutive registers
     ///
@@ -247,30 +255,40 @@ pub enum Op {
     /// `[*result, *lhs, *rhs]`
     Remainder,
 
-    /// Add-assign rhs -> lhs
+    /// Performs the power operation with lhs and rhs
+    ///
+    /// `[*result, *lhs, *rhs]`
+    Power,
+
+    /// lhs += rhs
     ///
     /// `[*lhs, *rhs]`
     AddAssign,
 
-    /// Subtract-assign rhs -> lhs
+    /// lhs -= rhs
     ///
     /// `[*lhs, *rhs]`
     SubtractAssign,
 
-    /// Multiply-assign rhs -> lhs
+    /// lhs *= rhs
     ///
     /// `[*lhs, *rhs]`
     MultiplyAssign,
 
-    /// Divide-assign rhs -> lhs
+    /// lhs /= rhs
     ///
     /// `[*lhs, *rhs]`
     DivideAssign,
 
-    /// Remainder-assign rhs -> lhs
+    /// lhs %= rhs
     ///
     /// `[*lhs, *rhs]`
     RemainderAssign,
+
+    /// lhs ^= rhs
+    ///
+    /// `[*lhs, *rhs]`
+    PowerAssign,
 
     /// Compares lhs and rhs using the '<' operator
     ///
@@ -434,15 +452,10 @@ pub enum Op {
     /// `[*result, *indexable, *index]`
     Index,
 
-    /// Sets a contained value via index
+    /// Assigns a contained value via index
     ///
     /// `[*indexable, *value, *index]`
-    IndexMut,
-
-    /// Inserts a key/value entry into a map
-    ///
-    /// `[*map, *key, *value]`
-    MapInsert,
+    IndexAssign,
 
     /// Inserts a key/value entry into a map's metamap
     ///
@@ -470,24 +483,38 @@ pub enum Op {
     /// `[*key, *name, *value]`
     MetaExportNamed,
 
-    /// Exports a value by adding it to the module's exports map
+    /// Exports a key/value pair by adding it to the module's exports map
     ///
     /// Used for expressions like `export foo = ...`
     ///
-    /// `[*name, *value]`
-    ValueExport,
+    /// `[*key, *value]`
+    ExportValue,
+
+    /// Exports an entry by adding it to the module's exports map
+    ///
+    /// - If the entry is a tuple, then it's assumed to be a key/value pair.
+    /// - If the entry is an iterator, then it's unpacked into a key/value pair.
+    /// - Otherwise an error will be thrown.
+    ///
+    /// `[*entry]`
+    ExportEntry,
 
     /// Accesses a contained value via a constant key
     ///
-    /// `[*target, @constant]`
+    /// `[*container, @constant]`
     Access,
 
-    /// Access a contained value via a string key
+    /// Accesses a contained value via a string key
     ///
-    /// Used in '.' access operations that use a quoted string, e.g. `foo."bar"`.
+    /// Used in `.` access operations that use a quoted string, e.g. `foo."bar"`.
     ///
-    /// `[*result, *value, *key]`
+    /// `[*result, *container, *key]`
     AccessString,
+
+    /// Assigns a key/value entry via `.` access
+    ///
+    /// `[*container, *key, *value]`
+    AccessAssign,
 
     /// Gets the size of a value
     ///
@@ -565,13 +592,27 @@ pub enum Op {
     /// `[*value, @type constant, jump_offset[2]]`
     CheckOptionalType,
 
+    /// Tries to access a contained value via a constant key
+    ///
+    /// If the access fails then the instruction pointer will be jumped forward to
+    /// the location referred to by the jump offset.
+    ///
+    /// This is used for match patterns.
+    ///
+    /// `[*container, @constant, jump_offset[2]]`
+    TryAccess,
+
+    /// Tries to access a contained value via a string key
+    ///
+    /// If the access fails then the instruction pointer will be jumped forward to
+    /// the location referred to by the jump offset.
+    ///
+    /// This is used for match patterns.
+    ///
+    /// `[*result, *container, *key, jump_offset[2]]`
+    TryAccessString,
+
     // Unused opcodes, allowing for a direct transmutation from a byte to an Op.
-    Unused89,
-    Unused90,
-    Unused91,
-    Unused92,
-    Unused93,
-    Unused94,
     Unused95,
     Unused96,
     Unused97,

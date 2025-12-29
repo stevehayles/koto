@@ -1,9 +1,13 @@
+use crate::{
+    geometry_arithmetic_op, geometry_arithmetic_op_rhs, geometry_comparison_op,
+    geometry_compound_assign_op,
+};
 use glam::DVec3;
 use koto_runtime::{Result, derive::*, prelude::*};
 use std::{fmt, ops};
 
 #[derive(Copy, Clone, PartialEq, KotoCopy, KotoType)]
-#[koto(use_copy)]
+#[koto(runtime = koto_runtime, use_copy)]
 pub struct Vec3(DVec3);
 
 #[koto_impl(runtime = koto_runtime)]
@@ -12,24 +16,57 @@ impl Vec3 {
         Self(DVec3::new(x, y, z))
     }
 
-    #[koto_method]
-    fn x(&self) -> KValue {
-        self.0.x.into()
+    #[koto_get]
+    fn x(&self) -> f64 {
+        self.0.x
+    }
+
+    #[koto_get]
+    fn y(&self) -> f64 {
+        self.0.y
+    }
+
+    #[koto_get]
+    fn z(&self) -> f64 {
+        self.0.z
+    }
+
+    #[koto_set]
+    fn set_x(&mut self, value: &KValue) -> Result<()> {
+        match value {
+            KValue::Number(x) => {
+                self.0.x = x.into();
+                Ok(())
+            }
+            unexpected => unexpected_type("a Number", unexpected),
+        }
+    }
+
+    #[koto_set]
+    fn set_y(&mut self, value: &KValue) -> Result<()> {
+        match value {
+            KValue::Number(y) => {
+                self.0.y = y.into();
+                Ok(())
+            }
+            unexpected => unexpected_type("a Number", unexpected),
+        }
+    }
+
+    #[koto_set]
+    fn set_z(&mut self, value: &KValue) -> Result<()> {
+        match value {
+            KValue::Number(z) => {
+                self.0.z = z.into();
+                Ok(())
+            }
+            unexpected => unexpected_type("a Number", unexpected),
+        }
     }
 
     #[koto_method]
-    fn y(&self) -> KValue {
-        self.0.y.into()
-    }
-
-    #[koto_method]
-    fn z(&self) -> KValue {
-        self.0.z.into()
-    }
-
-    #[koto_method]
-    fn length(&self) -> KValue {
-        (self.0.length()).into()
+    fn length(&self) -> f64 {
+        self.0.length()
     }
 }
 
@@ -39,56 +76,68 @@ impl KotoObject for Vec3 {
         Ok(())
     }
 
-    fn negate(&self, _vm: &mut KotoVm) -> Result<KValue> {
+    fn negate(&self) -> Result<KValue> {
         Ok(Self(-self.0).into())
     }
 
-    fn add(&self, rhs: &KValue) -> Result<KValue> {
-        geometry_arithmetic_op!(self, rhs, +)
+    fn add(&self, other: &KValue) -> Result<KValue> {
+        geometry_arithmetic_op!(self, other, +)
     }
 
-    fn subtract(&self, rhs: &KValue) -> Result<KValue> {
-        geometry_arithmetic_op!(self, rhs, -)
+    fn add_rhs(&self, other: &KValue) -> Result<KValue> {
+        geometry_arithmetic_op_rhs!(self, other, +)
     }
 
-    fn multiply(&self, rhs: &KValue) -> Result<KValue> {
-        geometry_arithmetic_op!(self, rhs, *)
+    fn subtract(&self, other: &KValue) -> Result<KValue> {
+        geometry_arithmetic_op!(self, other, -)
     }
 
-    fn divide(&self, rhs: &KValue) -> Result<KValue> {
-        geometry_arithmetic_op!(self, rhs, /)
+    fn subtract_rhs(&self, other: &KValue) -> Result<KValue> {
+        geometry_arithmetic_op_rhs!(self, other, -)
     }
 
-    fn add_assign(&mut self, rhs: &KValue) -> Result<()> {
-        geometry_compound_assign_op!(self, rhs, +=)
+    fn multiply(&self, other: &KValue) -> Result<KValue> {
+        geometry_arithmetic_op!(self, other, *)
     }
 
-    fn subtract_assign(&mut self, rhs: &KValue) -> Result<()> {
-        geometry_compound_assign_op!(self, rhs, -=)
+    fn multiply_rhs(&self, other: &KValue) -> Result<KValue> {
+        geometry_arithmetic_op_rhs!(self, other, *)
     }
 
-    fn multiply_assign(&mut self, rhs: &KValue) -> Result<()> {
-        geometry_compound_assign_op!(self, rhs, *=)
+    fn divide(&self, other: &KValue) -> Result<KValue> {
+        geometry_arithmetic_op!(self, other, /)
     }
 
-    fn divide_assign(&mut self, rhs: &KValue) -> Result<()> {
-        geometry_compound_assign_op!(self, rhs, /=)
+    fn divide_rhs(&self, other: &KValue) -> Result<KValue> {
+        geometry_arithmetic_op_rhs!(self, other, /)
     }
 
-    fn equal(&self, rhs: &KValue) -> Result<bool> {
-        geometry_comparison_op!(self, rhs, ==)
+    fn add_assign(&mut self, other: &KValue) -> Result<()> {
+        geometry_compound_assign_op!(self, other, +=)
     }
 
-    fn not_equal(&self, rhs: &KValue) -> Result<bool> {
-        geometry_comparison_op!(self, rhs, !=)
+    fn subtract_assign(&mut self, other: &KValue) -> Result<()> {
+        geometry_compound_assign_op!(self, other, -=)
+    }
+
+    fn multiply_assign(&mut self, other: &KValue) -> Result<()> {
+        geometry_compound_assign_op!(self, other, *=)
+    }
+
+    fn divide_assign(&mut self, other: &KValue) -> Result<()> {
+        geometry_compound_assign_op!(self, other, /=)
+    }
+
+    fn equal(&self, other: &KValue) -> Result<bool> {
+        geometry_comparison_op!(self, other, ==)
     }
 
     fn index(&self, index: &KValue) -> Result<KValue> {
         match index {
             KValue::Number(n) => match usize::from(n) {
-                0 => Ok(self.x()),
-                1 => Ok(self.y()),
-                2 => Ok(self.z()),
+                0 => Ok(self.x().into()),
+                1 => Ok(self.y().into()),
+                2 => Ok(self.z().into()),
                 other => runtime_error!("index out of range (got {other}, should be <= 2)"),
             },
             unexpected => unexpected_type("Number", unexpected),
@@ -119,6 +168,12 @@ impl KotoObject for Vec3 {
 impl From<DVec3> for Vec3 {
     fn from(v: DVec3) -> Self {
         Self(v)
+    }
+}
+
+impl From<f64> for Vec3 {
+    fn from(x: f64) -> Self {
+        Self::new(x, x, x)
     }
 }
 

@@ -34,13 +34,18 @@ impl KList {
     }
 
     /// Returns a reference to the list's entries
-    pub fn data(&self) -> Borrow<ValueVec> {
+    pub fn data(&self) -> Borrow<'_, ValueVec> {
         self.0.borrow()
     }
 
     /// Returns a mutable reference to the list's entries
-    pub fn data_mut(&self) -> BorrowMut<ValueVec> {
+    pub fn data_mut(&self) -> BorrowMut<'_, ValueVec> {
         self.0.borrow_mut()
+    }
+
+    /// Returns true if the lists refer to the same underlying data
+    pub fn is_same_instance(&self, other: &Self) -> bool {
+        PtrMut::ptr_eq(&self.0, &other.0)
     }
 
     /// Renders the list to the provided display context

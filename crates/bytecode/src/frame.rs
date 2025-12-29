@@ -56,7 +56,7 @@ enum LocalRegister {
     // Instructions can be deferred until the register is committed,
     // e.g. for functions that need to capture themselves after they've been fully assigned.
     Reserved(ConstantIndex, Vec<DeferredOp>),
-    // The register contains a value not associated with an id, e.g. a wildcard function arg
+    // The register contains a value not associated with an id, e.g. an ignored function arg
     Allocated,
 }
 
@@ -250,7 +250,10 @@ impl Frame {
         }
     }
 
-    // Provides the next temporary register
+    // Pushes a temporary register to the stack
+    //
+    // The register must be returned by the caller,
+    // either by calling pop_register() or truncate_register_stack().
     pub fn push_register(&mut self) -> Result<u8, FrameError> {
         let new_register = self.temporary_base + self.temporary_count;
 
@@ -265,7 +268,7 @@ impl Frame {
         }
     }
 
-    // Returns the most recently used temporary register to the stack
+    // Removes the most recently used temporary register from the stack
     pub fn pop_register(&mut self) -> Result<u8, FrameError> {
         let Some(register) = self.register_stack.pop() else {
             return Err(FrameError::EmptyRegisterStack);

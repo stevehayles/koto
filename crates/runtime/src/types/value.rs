@@ -1,6 +1,6 @@
 //! The core value type used in the Koto runtime
 
-use crate::{KFunction, Ptr, Result, prelude::*};
+use crate::{KFunction, Ptr, Result, lazy, prelude::*};
 use std::{
     fmt::{self, Write},
     result::Result as StdResult,
@@ -152,35 +152,41 @@ impl KValue {
         }
     }
 
+    /// Returns true if the values refer to the same underlying data
+    pub fn is_same_instance(&self, other: &Self) -> bool {
+        use KValue::*;
+        match (self, other) {
+            (Map(a), Map(b)) => a.is_same_instance(b),
+            (Object(a), Object(b)) => a.is_same_instance(b),
+            (List(a), List(b)) => a.is_same_instance(b),
+            (Tuple(a), Tuple(b)) => a.is_same_instance(b),
+            _ => false,
+        }
+    }
+
     /// Returns the value's type as a [KString]
     pub fn type_as_string(&self) -> KString {
         use KValue::*;
-
         match &self {
-            Null => "Null".into(),
-            Bool(_) => "Bool".into(),
-            Number(_) => "Number".into(),
-            List(_) => "List".into(),
-            Range { .. } => "Range".into(),
-            Map(m) if m.meta_map().is_some() => match m.get_meta_value(&MetaKey::Type) {
-                Some(Str(s)) => s,
-                Some(_) => "Error: expected string as result of @type".into(),
-                None => match m.get_meta_value(&MetaKey::Base) {
-                    Some(base @ Map(_)) => base.type_as_string(),
-                    _ => "Object".into(),
-                },
-            },
-            Map(_) => "Map".into(),
-            Str(_) => "String".into(),
-            Tuple(_) => "Tuple".into(),
-            Function(f) if f.flags.is_generator() => "Generator".into(),
-            Function(_) | NativeFunction(_) => "Function".into(),
+            Null => lazy!(KString; "Null"),
+            Bool(_) => lazy!(KString; "Bool"),
+            Number(_) => lazy!(KString; "Number"),
+            List(_) => lazy!(KString; "List"),
+            Range { .. } => lazy!(KString; "Range"),
+            Map(m) if m.meta_map().is_some() => {
+                m.meta_type().unwrap_or_else(|| lazy!(KString; "Object"))
+            }
+            Map(_) => lazy!(KString; "Map"),
+            Str(_) => lazy!(KString; "String"),
+            Tuple(_) => lazy!(KString; "Tuple"),
+            Function(f) if f.flags.is_generator() => lazy!(KString; "Generator"),
+            Function(_) | NativeFunction(_) => lazy!(KString; "Function"),
             Object(o) => o.try_borrow().map_or_else(
                 |_| "Error: object already borrowed".into(),
                 |o| o.type_string(),
             ),
-            Iterator(_) => "Iterator".into(),
-            TemporaryTuple { .. } => "Temporary_tuple".into(),
+            Iterator(_) => lazy!(KString; "Iterator"),
+            TemporaryTuple { .. } => lazy!(KString; "TemporaryTuple"),
         }
     }
 
@@ -194,7 +200,7 @@ impl KValue {
             Range(r) => write!(ctx, "{r}"),
             Function(f) => {
                 if ctx.debug_enabled() {
-                    write!(ctx, "|| ({})", Ptr::address(&f.chunk))
+                    write!(ctx, "|| (chunk: {}, ip: {})", Ptr::address(&f.chunk), f.ip)
                 } else {
                     write!(ctx, "||")
                 }
@@ -337,8 +343,8 @@ where
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RegisterSlice {
-    pub start: u8,
-    pub count: u8,
+    pub start: usize,
+    pub count: usize,
 }
 
 /// If conversion fails then the input value will be returned.
